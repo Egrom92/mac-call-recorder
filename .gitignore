@@ -1,0 +1,6 @@
+.DS_Store
+*.app/
+*.wav
+*.m4a
+*.mka
+*.log
