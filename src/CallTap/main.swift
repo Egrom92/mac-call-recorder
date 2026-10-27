@@ -230,41 +230,6 @@ final class TapCapture {
 
 // MARK: - Запись звонка без OBS
 
-/// Отдельный клиент микрофона: открывает устройство напрямую, как это делает OBS. Тогда AirPods надёжно
-/// переключаются в режим гарнитуры; если микрофон открыт только внутри aggregate-устройства, это переключение
-/// иногда не происходит, и устройство не отдаёт ни одного кадра.
-final class MicWaker {
-    private let device: AudioObjectID
-    private var proc: AudioDeviceIOProcID?
-    /// Сколько раз пришли данные с микрофона; растёт в аудиопотоке.
-    private(set) var callbacks = 0
-
-    init?(device: AudioObjectID) {
-        self.device = device
-        let st = AudioDeviceCreateIOProcIDWithBlock(&proc, device, nil) { [unowned self] _, inData, _, outData, _ in
-            for o in UnsafeMutableAudioBufferListPointer(outData) { if let d = o.mData { memset(d, 0, Int(o.mDataByteSize)) } }
-            let ins = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inData))
-            if ins.contains(where: { $0.mData != nil && $0.mDataByteSize > 0 }) { self.callbacks += 1 }
-        }
-        guard st == noErr, AudioDeviceStart(device, proc) == noErr else { stop(); return nil }
-    }
-
-    /// Ждёт первых данных с микрофона не дольше timeout секунд; возвращает время ожидания или nil.
-    func waitAlive(timeout: TimeInterval) -> TimeInterval? {
-        let start = Date()
-        while callbacks == 0 {
-            if Date().timeIntervalSince(start) > timeout { return nil }
-            Thread.sleep(forTimeInterval: 0.1)
-        }
-        return Date().timeIntervalSince(start)
-    }
-
-    func stop() {
-        if let proc { AudioDeviceStop(device, proc); AudioDeviceDestroyIOProcID(device, proc) }
-        proc = nil
-    }
-}
-
 /// Пишет WAV с двумя каналами: 1 — собеседник (общий tap звука Mac), 2 — микрофон.
 /// Tap и микрофон собраны в одно aggregate-устройство с часами BlackHole, поэтому идут синхронно.
 /// Если устройство перестаёт отдавать звук (AirPods в этот момент переключили режим или переподключились),
@@ -274,7 +239,6 @@ final class CallRecorder {
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggID = AudioObjectID(kAudioObjectUnknown)
     private var ioProc: AudioDeviceIOProcID?
-    private var waker: MicWaker?
     private var file: ExtAudioFileRef?
     private let maxFrames = 16384
     private let frames = UnsafeMutablePointer<Float>.allocate(capacity: 2 * 16384)
@@ -306,11 +270,6 @@ final class CallRecorder {
 
     /// Создаёт tap и aggregate (BlackHole — часы, микрофон, tap) и возвращает частоту устройства; звук ещё не идёт.
     private func startCapture(micUID: String) -> Float64? {
-        if let mic = allDevices().first(where: { $0.uid == micUID }), let w = MicWaker(device: mic.id) {
-            waker = w
-            if let t = w.waitAlive(timeout: 4) { log(String(format: "микрофон «%@» готов через %.1f с", mic.name, t)) }
-            else { log("⚠️ микрофон «\(mic.name)» не отдал звук за 4 с") }
-        }
         let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: exclude)
         desc.uuid = UUID()
         desc.name = "CallTap record"
@@ -393,8 +352,6 @@ final class CallRecorder {
     private func stopCapture() {
         if let ioProc { AudioDeviceStop(aggID, ioProc); AudioDeviceDestroyIOProcID(aggID, ioProc) }
         ioProc = nil
-        waker?.stop()
-        waker = nil
         if aggID != kAudioObjectUnknown { AudioHardwareDestroyAggregateDevice(aggID); aggID = kAudioObjectUnknown }
         if tapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tapID); tapID = kAudioObjectUnknown }
     }
@@ -452,13 +409,8 @@ func runBridge() {
 var keepAlive: [AnyObject] = []
 
 /// Микрофон для записи — AirPods, если подключены, иначе системный вход по умолчанию.
-/// С avoidAirPods — встроенный микрофон Mac (запасной вариант, если AirPods не отдают звук).
-func findMic(avoidAirPods: Bool = false) -> Device? {
+func findMic() -> Device? {
     let devices = allDevices()
-    if avoidAirPods {
-        return devices.first(where: { $0.uid == "BuiltInMicrophoneDevice" })
-            ?? devices.first(where: { !$0.name.contains("AirPods") && $0.uid != blackHoleUID && hasStreams($0.id, kAudioObjectPropertyScopeInput) })
-    }
     let defaultIn = defaultDevice(kAudioHardwarePropertyDefaultInputDevice)
     return devices.first(where: { $0.name.contains("AirPods") && hasStreams($0.id, kAudioObjectPropertyScopeInput) })
         ?? devices.first(where: { $0.id == defaultIn })
@@ -494,23 +446,17 @@ func runRecord(path: String) {
 
     // Сторож: если кадры не поступают (на старте 5 с, дальше 3 с), устройство захвата пересоздаётся.
     // Так бывает, когда AirPods при запуске переключаются в режим гарнитуры или переподключаются посреди записи.
-    // После двух неудачных перезапусков подряд AirPods заменяются встроенным микрофоном Mac — чтобы голос записался в любом случае.
-    var lastFrames = 0, lastProgress = Date(), started = false, failedRestarts = 0, avoidAirPods = false
+    var lastFrames = 0, lastProgress = Date(), started = false
     let watchdog = DispatchSource.makeTimerSource(queue: .main)
     watchdog.schedule(deadline: .now() + 1, repeating: 1)
     watchdog.setEventHandler {
         let written = rec.framesWritten
-        if written != lastFrames { lastFrames = written; lastProgress = Date(); started = true; failedRestarts = 0; return }
+        if written != lastFrames { lastFrames = written; lastProgress = Date(); started = true; return }
         let stalled = Date().timeIntervalSince(lastProgress)
         guard stalled >= (started ? 3 : 5) else { return }
-        if failedRestarts >= 2 && !avoidAirPods, let builtIn = findMic(avoidAirPods: true) {
-            avoidAirPods = true
-            log("⚠️ микрофон AirPods не отдаёт звук — пишу встроенный микрофон «\(builtIn.name)»")
-        }
-        let mic = findMic(avoidAirPods: avoidAirPods)
+        let mic = findMic()
         log("⚠️ звук не поступает \(Int(stalled)) с — перезапускаю захват" + (mic.map { " (микрофон «\($0.name)»)" } ?? ""))
         if let mic, rec.restart(micUID: mic.uid) { log("✅ захват перезапущен") } else { log("⚠️ перезапустить не удалось, попробую ещё раз") }
-        failedRestarts += 1
         lastProgress = Date()
     }
     watchdog.resume()
