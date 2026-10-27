@@ -121,20 +121,25 @@ ln -sf "$DIR/call-recorder.sh" "$(brew --prefix)/bin/call-recorder"
 if ! system_profiler SPAudioDataType 2>/dev/null | grep -q "BlackHole 2ch"; then
     say "BlackHole 2ch пока не виден системе — перезагрузите Mac, и всё заработает."
 else
-    say "Проверяю запись (5 секунд). macOS может спросить доступ к записи звука и к микрофону для CallTap — нажмите «Разрешить»."
+    # Первый запуск CallTap (и первый после обновления) показывает окна разрешений; пока они открыты,
+    # запись не стартует — поэтому ждём до 30 секунд.
+    say "Проверяю запись. macOS спросит доступ CallTap к микрофону и к записи системного звука — нажмите «Разрешить» (жду до 30 секунд)."
     test_log="$DIR/logs/install-check.log"; : > "$test_log"
     open -n -g "$CALLTAP_APP" --stdout "$test_log" --stderr "$test_log" --args record "$DIR/logs/install-check.wav"
-    sleep 5
+    for _ in $(seq 1 60); do grep -qE "уровень|❌" "$test_log" && break; sleep 0.5; done
     pkill -TERM -f "$CALLTAP_APP/Contents/MacOS/CallTap record" 2>/dev/null || true
     sleep 1
     rm -f "$DIR/logs/install-check.wav"
-    if grep -q "запись идёт" "$test_log"; then
-        grep "уровень" "$test_log" | head -1 | sed 's/^/   /' || true
+    if grep -q "уровень" "$test_log"; then
+        grep "уровень" "$test_log" | head -1 | sed 's/^/   /'
         if grep "уровень" "$test_log" | head -1 | grep -q "микрофон   -inf"; then
-            echo "   Микрофон пока пишет тишину — если вы только что нажали «Разрешить», это нормально."
+            echo "   Микрофон пишет тишину: проверьте, что CallTap разрешён в Системных настройках →"
+            echo "   Конфиденциальность и безопасность → Микрофон."
         fi
     else
-        echo "⚠️  Проверка не прошла:"; cat "$test_log"
+        echo "⚠️  Проверка не дождалась начала записи. Если окна разрешений ещё открыты — нажмите «Разрешить»;"
+        echo "   потом запустите запись кнопкой и проверьте файл. Журнал проверки:"
+        sed 's/^/   /' "$test_log"
     fi
 fi
 
