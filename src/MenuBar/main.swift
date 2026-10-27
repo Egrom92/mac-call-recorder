@@ -237,6 +237,7 @@ final class DetailsWindow: NSObject {
         recordButton.action = #selector(recordPressed)
         recordButton.bezelStyle = .rounded
         recordButton.keyEquivalent = "\r"
+        recordButton.imagePosition = .imageLeading
         let folderButton = NSButton(title: "Открыть папку", target: app, action: #selector(AppDelegate.openFolder))
         folderButton.bezelStyle = .rounded
         let separator = NSBox()
@@ -279,7 +280,11 @@ final class DetailsWindow: NSObject {
             fitToContent()
         }
         splitBox.state = splitEnabled() ? .on : .off
-        recordButton.title = app.recording ? "Завершить запись" : "Начать запись"
+        let title = app.recording ? "Завершить запись" : "Начать запись"
+        if recordButton.title != title {
+            recordButton.title = title
+            recordButton.image = symbol(app.recording ? "stop.circle.fill" : "record.circle.fill")
+        }
         recordButton.isEnabled = !app.busy
     }
 
@@ -475,7 +480,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         menu.addItem(.separator())
-        _ = add(recording ? "Завершить запись" : "Начать запись", #selector(toggle), enabled: !busy)
+        // Главное действие — со значком (● записать / ■ остановить) и полужирным, чтобы сразу бросалось в глаза.
+        let action = add(recording ? "Завершить запись" : "Начать запись", #selector(toggle), enabled: !busy)
+        action.image = recording ? symbol("stop.circle.fill") : symbol("record.circle.fill", red: true)
+        let menuFont = NSFont.menuFont(ofSize: 0)
+        action.attributedTitle = NSAttributedString(string: action.title,
+                                                    attributes: [.font: NSFont.systemFont(ofSize: menuFont.pointSize, weight: .semibold)])
         _ = add("Показать детали…", #selector(showDetails))
         menu.addItem(.separator())
         _ = add("Открыть папку с записями", #selector(openFolder))
