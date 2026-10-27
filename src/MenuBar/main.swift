@@ -1,6 +1,6 @@
-// «Запись звонков» — кнопка в строке меню: клик начинает или останавливает запись (~/.call-recorder/call-recorder.sh on/off),
-// иконка показывает состояние: ◯ — запись не идёт, красный ● с таймером — идёт запись.
-// Правый клик (или Control-клик) открывает меню.
+// «Запись звонков» — кнопка в строке меню: клик открывает меню с «Начать запись» / «Завершить запись»
+// (~/.call-recorder/call-recorder.sh on/off) и, пока идёт запись, живыми шкалами уровней.
+// Иконка показывает состояние: ◯ — запись не идёт, красный ● с таймером — идёт запись.
 import AppKit
 import ServiceManagement
 
@@ -151,22 +151,70 @@ final class LevelMeterView: NSView {
     }
 }
 
+/// Две шкалы — «Собеседник» и «Я (микрофон)» — со значениями в дБ; одни и те же для окна «Детали» и меню.
+/// Шкала падает на 30 дБ/с, если громкость снизилась или новых данных нет; риска пика держится 1,5 с.
+final class LevelsView: NSStackView {
+    private let farMeter = LevelMeterView(), micMeter = LevelMeterView()
+    private let farValue = NSTextField(labelWithString: "—"), micValue = NSTextField(labelWithString: "—")
+    private var farHold: (db: Float, at: Date) = (-60, .distantPast)
+    private var micHold: (db: Float, at: Date) = (-60, .distantPast)
+
+    init(meterWidth: CGFloat) {
+        super.init(frame: .zero)
+        orientation = .vertical
+        alignment = .leading
+        spacing = 10
+        addArrangedSubview(row("Собеседник", farMeter, farValue, meterWidth))
+        addArrangedSubview(row("Я (микрофон)", micMeter, micValue, meterWidth))
+    }
+
+    required init?(coder: NSCoder) { fatalError("не используется") }
+
+    /// fresh — пики каналов (0…1), дописанные в WAV с прошлого раза; nil — новых данных нет.
+    func update(_ fresh: (far: Float, mic: Float)?) {
+        apply(farMeter, farValue, &farHold, fresh?.far)
+        apply(micMeter, micValue, &micHold, fresh?.mic)
+    }
+
+    private func row(_ title: String, _ meter: LevelMeterView, _ value: NSTextField, _ meterWidth: CGFloat) -> NSStackView {
+        let label = NSTextField(labelWithString: title)
+        label.widthAnchor.constraint(equalToConstant: 96).isActive = true
+        meter.widthAnchor.constraint(equalToConstant: meterWidth).isActive = true
+        meter.heightAnchor.constraint(equalToConstant: 10).isActive = true
+        value.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        value.textColor = .secondaryLabelColor
+        value.alignment = .right
+        value.widthAnchor.constraint(equalToConstant: 56).isActive = true
+        let row = NSStackView(views: [label, meter, value])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        return row
+    }
+
+    private func apply(_ meter: LevelMeterView, _ value: NSTextField, _ hold: inout (db: Float, at: Date), _ peak: Float?) {
+        var db = meter.level - 1.5
+        if let peak, peak > 0 { db = max(db, 20 * log10(peak)) }
+        db = max(-60, min(0, db))
+        meter.level = db
+        if db >= hold.db || Date().timeIntervalSince(hold.at) > 1.5 { hold = (db, Date()) }
+        meter.peak = hold.db
+        value.stringValue = db <= -59.5 ? "—" : String(format: "%.0f дБ", db)
+    }
+}
+
 /// Небольшое окно поверх остальных: уровни собеседника и микрофона в реальном времени,
-/// кнопка записи и настройка «сохранять голоса отдельно».
-final class DetailsWindow: NSObject, NSWindowDelegate {
+/// кнопка записи и настройка «сохранять голоса отдельно». Уровни ему передаёт AppDelegate.
+final class DetailsWindow: NSObject {
     private unowned let app: AppDelegate
     private let panel: NSPanel
     private let status = NSTextField(labelWithString: "")
-    private let farMeter = LevelMeterView(), micMeter = LevelMeterView()
-    private let farValue = NSTextField(labelWithString: ""), micValue = NSTextField(labelWithString: "")
+    private let levels = LevelsView(meterWidth: 200)
     private let warning = NSTextField(wrappingLabelWithString: "")
     private let splitBox = NSButton(checkboxWithTitle: "Сохранять голоса отдельно: «я» и «собеседник»", target: nil, action: nil)
     private let recordButton = NSButton(title: "", target: nil, action: nil)
-    private let reader = WavLevelReader()
-    private var timer: Timer?
-    private var farHold: (db: Float, at: Date) = (-60, .distantPast)
-    private var micHold: (db: Float, at: Date) = (-60, .distantPast)
-    private var lastData = Date.distantPast
+
+    var isVisible: Bool { panel.isVisible }
 
     init(app: AppDelegate) {
         self.app = app
@@ -178,7 +226,6 @@ final class DetailsWindow: NSObject, NSWindowDelegate {
         panel.level = .floating
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
-        panel.delegate = self
 
         status.font = .boldSystemFont(ofSize: 13)
         warning.textColor = .systemOrange
@@ -195,8 +242,7 @@ final class DetailsWindow: NSObject, NSWindowDelegate {
         let separator = NSBox()
         separator.boxType = .separator
 
-        let stack = NSStackView(views: [status, meterRow("Собеседник", farMeter, farValue), meterRow("Я (микрофон)", micMeter, micValue),
-                                        warning, separator, splitBox, NSStackView(views: [recordButton, folderButton])])
+        let stack = NSStackView(views: [status, levels, warning, separator, splitBox, NSStackView(views: [recordButton, folderButton])])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 12
@@ -206,58 +252,22 @@ final class DetailsWindow: NSObject, NSWindowDelegate {
         panel.contentView = stack
     }
 
-    private func meterRow(_ title: String, _ meter: LevelMeterView, _ value: NSTextField) -> NSStackView {
-        let label = NSTextField(labelWithString: title)
-        label.widthAnchor.constraint(equalToConstant: 96).isActive = true
-        meter.widthAnchor.constraint(equalToConstant: 200).isActive = true
-        meter.heightAnchor.constraint(equalToConstant: 10).isActive = true
-        value.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        value.textColor = .secondaryLabelColor
-        value.alignment = .right
-        value.widthAnchor.constraint(equalToConstant: 56).isActive = true
-        let row = NSStackView(views: [label, meter, value])
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 8
-        return row
-    }
-
     func show() {
-        tick()
+        tick(nil)
         fitToContent()
         if !panel.isVisible { panel.center() }
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in self?.tick() }
+        app.startLevelTicker()
     }
 
-    func windowWillClose(_ notification: Notification) {
-        timer?.invalidate()
-        timer = nil
-    }
-
-    private func tick() {
-        let fresh = app.recording ? reader.read() : nil
-        if fresh != nil { lastData = Date() }
-        update(farMeter, farValue, &farHold, fresh.map { $0.far })
-        update(micMeter, micValue, &micHold, fresh.map { $0.mic })
-
-        if app.busy {
-            status.stringValue = "Подождите…"
-            status.textColor = .labelColor
-        } else if app.recording {
-            status.stringValue = "● Идёт запись · " + app.elapsed()
-            status.textColor = .systemRed
-        } else {
-            status.stringValue = "Запись не идёт"
-            status.textColor = .labelColor
-        }
-        // Файл записи не растёт — звук не поступает (CallTap в это время сам перезапускает захват).
-        let started = app.recordingStart.map { Date().timeIntervalSince($0) > 6 } ?? false
+    func tick(_ fresh: (far: Float, mic: Float)?) {
+        levels.update(fresh)
+        status.stringValue = app.statusText()
+        status.textColor = app.recording && !app.busy ? .systemRed : .labelColor
         let text: String
-        if app.recording && started && Date().timeIntervalSince(lastData) > 4 {
-            text = "⚠︎ Звук не поступает — CallTap перезапускает захват. Если это не проходит, остановите и начните запись снова."
+        if app.noAudio() {
+            text = "⚠︎ Звук не поступает — CallTap перезапускает захват. Если это не проходит, завершите и начните запись снова."
         } else if app.recording && micSilent() {
             text = "⚠︎ Микрофон молчит больше 10 секунд — ваш голос не пишется. Разрешите CallTap доступ к микрофону в Системных настройках."
         } else {
@@ -269,7 +279,7 @@ final class DetailsWindow: NSObject, NSWindowDelegate {
             fitToContent()
         }
         splitBox.state = splitEnabled() ? .on : .off
-        recordButton.title = app.recording ? "Остановить и сохранить" : "Начать запись"
+        recordButton.title = app.recording ? "Завершить запись" : "Начать запись"
         recordButton.isEnabled = !app.busy
     }
 
@@ -279,31 +289,47 @@ final class DetailsWindow: NSObject, NSWindowDelegate {
         panel.setContentSize(content.fittingSize)
     }
 
-    /// Шкала падает на 30 дБ/с, если громкость снизилась или новых данных нет; риска пика держится 1,5 с.
-    private func update(_ meter: LevelMeterView, _ value: NSTextField, _ hold: inout (db: Float, at: Date), _ peak: Float?) {
-        var db = meter.level - 1.5
-        if let peak, peak > 0 { db = max(db, 20 * log10(peak)) }
-        db = max(-60, min(0, db))
-        meter.level = db
-        if db >= hold.db || Date().timeIntervalSince(hold.at) > 1.5 { hold = (db, Date()) }
-        meter.peak = hold.db
-        value.stringValue = db <= -59.5 ? "—" : String(format: "%.0f дБ", db)
-    }
-
     @objc private func splitChanged() { setSplitEnabled(splitBox.state == .on) }
     @objc private func recordPressed() { app.toggle() }
 }
 
 // MARK: - Кнопка в строке меню
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+/// Клик по кнопке (левой или правой кнопкой мыши) открывает меню: «Начать запись» / «Завершить запись»,
+/// а пока идёт запись — ещё и живые шкалы уровней.
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var item: NSStatusItem!
     let menu = NSMenu()
-    lazy var details = DetailsWindow(app: self)
+    private var detailsWindow: DetailsWindow?
     var busy = false
     var recording = false
     var recordingStart: Date?
     var timer: Timer?
+
+    // Уровни читаются из WAV одним таймером, пока открыто меню или окно «Детали».
+    private let reader = WavLevelReader()
+    private let menuLevels = LevelsView(meterWidth: 150)
+    private var statusMenuItem: NSMenuItem?
+    private var menuOpen = false
+    private var levelTimer: Timer?
+    private var lastLevelData = Date.distantPast
+
+    /// Шкалы для меню: своё view в пункте меню с отступами, как у обычных пунктов.
+    private lazy var menuLevelsItem: NSMenuItem = {
+        let container = NSView()
+        menuLevels.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(menuLevels)
+        NSLayoutConstraint.activate([
+            menuLevels.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
+            menuLevels.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
+            menuLevels.topAnchor.constraint(equalTo: container.topAnchor, constant: 4),
+            menuLevels.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -6),
+        ])
+        container.frame.size = container.fittingSize
+        let mi = NSMenuItem()
+        mi.view = container
+        return mi
+    }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Новые значки встают левее всех и на MacBook прячутся под «чёлку»; ставим кнопку рядом с батареей
@@ -313,13 +339,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.autosaveName = "CallRecorder"
         item.isVisible = true
-        menu.autoenablesItems = false
-        item.button?.target = self
-        item.button?.action = #selector(clicked)
-        item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         item.button?.imagePosition = .imageLeading
+        menu.autoenablesItems = false
+        menu.delegate = self
+        item.menu = menu
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.refresh() }
+        // Пока меню открыто, главный цикл работает в режиме отслеживания событий, и обычные таймеры
+        // не срабатывают; в режиме .common время на кнопке идёт и при открытом меню.
+        let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.refresh() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
         // Где оказалась кнопка — для проверки, не попала ли она под «чёлку».
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             let frame = self?.item.button?.window?.frame ?? .zero
@@ -330,16 +359,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc func clicked() {
-        let event = NSApp.currentEvent
-        if event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true {
-            buildMenu()
-            item.menu = menu
-            item.button?.performClick(nil)
-            item.menu = nil
-        } else {
-            toggle()
+    // MARK: Меню
+
+    func menuNeedsUpdate(_ menu: NSMenu) { buildMenu() }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        menuOpen = true
+        startLevelTicker()
+    }
+
+    func menuDidClose(_ menu: NSMenu) { menuOpen = false }
+
+    func startLevelTicker() {
+        guard levelTimer == nil else { return }
+        let t = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in self?.levelTick() }
+        RunLoop.main.add(t, forMode: .common)
+        levelTimer = t
+    }
+
+    private func levelTick() {
+        let detailsVisible = detailsWindow?.isVisible ?? false
+        guard menuOpen || detailsVisible else { levelTimer?.invalidate(); levelTimer = nil; return }
+        let fresh = recording ? reader.read() : nil
+        if fresh != nil { lastLevelData = Date() }
+        if menuOpen {
+            menuLevels.update(fresh)
+            statusMenuItem?.title = statusText()
         }
+        if detailsVisible { detailsWindow?.tick(fresh) }
+    }
+
+    /// Файл записи не растёт больше 4 с (не считая первых 6 с) — звук не поступает.
+    func noAudio() -> Bool {
+        guard recording, let start = recordingStart, Date().timeIntervalSince(start) > 6 else { return false }
+        return Date().timeIntervalSince(lastLevelData) > 4
+    }
+
+    func statusText() -> String {
+        if busy { return "Подождите…" }
+        return recording ? "● Идёт запись · " + elapsed() : "Запись не идёт"
     }
 
     @objc func toggle() {
@@ -384,12 +442,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let silent = micSilent()
             b.image = symbol("record.circle.fill", red: true)
             b.title = " " + elapsed() + (silent ? " ⚠︎" : "")
-            b.toolTip = silent ? "Идёт запись, но микрофон молчит — разрешите CallTap доступ к микрофону (правый клик → меню)"
-                               : "Идёт запись звонка. Клик — остановить и сохранить"
+            b.toolTip = silent ? "Идёт запись, но микрофон молчит — разрешите CallTap доступ к микрофону (клик → меню)"
+                               : "Идёт запись звонка. Клик — меню, там «Завершить запись»"
         } else {
             b.image = symbol("record.circle")
             b.title = ""
-            b.toolTip = "Запись звонков. Клик — начать запись, правый клик — меню"
+            b.toolTip = "Запись звонков. Клик — меню, там «Начать запись»"
         }
     }
 
@@ -408,13 +466,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(mi)
             return mi
         }
-        _ = add(recording ? "Идёт запись · \(elapsed())" : "Запись не идёт", nil)
-        if recording && micSilent() {
-            _ = add("⚠︎ Микрофон молчит — ваш голос не пишется", nil)
-            _ = add("Открыть настройки доступа к микрофону…", #selector(openMicSettings))
+        statusMenuItem = add(statusText(), nil)
+        if recording {
+            menu.addItem(menuLevelsItem)
+            if micSilent() {
+                _ = add("⚠︎ Микрофон молчит — ваш голос не пишется", nil)
+                _ = add("Открыть настройки доступа к микрофону…", #selector(openMicSettings))
+            }
         }
         menu.addItem(.separator())
-        _ = add(recording ? "Остановить и сохранить" : "Начать запись", #selector(toggle), enabled: !busy)
+        _ = add(recording ? "Завершить запись" : "Начать запись", #selector(toggle), enabled: !busy)
         _ = add("Показать детали…", #selector(showDetails))
         menu.addItem(.separator())
         _ = add("Открыть папку с записями", #selector(openFolder))
@@ -427,7 +488,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = add("Убрать кнопку (запись не остановится)", #selector(quit))
     }
 
-    @objc func showDetails() { details.show() }
+    @objc func showDetails() {
+        if detailsWindow == nil { detailsWindow = DetailsWindow(app: self) }
+        detailsWindow?.show()
+    }
 
     @objc func toggleSplit() { setSplitEnabled(!splitEnabled()) }
 
