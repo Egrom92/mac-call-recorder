@@ -2,11 +2,13 @@
 # Запись звонков на Mac: оба голоса в один файл.
 # CallTap пишет собеседника через Core Audio Process Tap (весь звук приложений Mac) и ваш голос с микрофона —
 # AirPods, если они подключены, иначе микрофон по умолчанию. Маршрут звонка не меняется.
-#   call-recorder on      — начать запись
-#   call-recorder off     — остановить и сохранить
-#   call-recorder status  — идёт ли запись
+#   call-recorder on             — начать запись
+#   call-recorder off            — остановить и сохранить
+#   call-recorder status         — идёт ли запись
+#   call-recorder split on|off   — сохранять ли голоса отдельными файлами (по умолчанию да)
 # Записи: ~/Movies/Записи звонков/«Звонок <дата время>»/ — папка на каждый звонок с тремя файлами:
 #         «… — оба голоса.m4a», «… — я.m4a», «… — собеседник.m4a» (громкость выровнена).
+#         С split off — один файл «Звонок <дата время>.m4a» с обоими голосами.
 set -u
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 DIR="$HOME/.call-recorder"
@@ -14,7 +16,11 @@ APP="$DIR/CallTap.app"
 BIN="$APP/Contents/MacOS/CallTap"
 LOG="$DIR/logs/calltap.log"
 CUR="$DIR/current"   # здесь лежит WAV, пока идёт запись
+SETTINGS="$DIR/settings"   # строки вида split=no; их же меняет кнопка в строке меню
 REC_DIR="$HOME/Movies/Записи звонков"
+
+setting() { sed -n "s/^$1=//p" "$SETTINGS" 2>/dev/null | tail -1; }
+split_enabled() { [ "$(setting split)" != "no" ]; }
 
 recording() { pgrep -f "$BIN record" >/dev/null; }
 # Микрофон молчит: CallTap пишет уровни через 3 с и дальше раз в 10 с; первые секунды AirPods ещё
@@ -49,20 +55,35 @@ stop() {
         [ -f "$w" ] || continue
         found=1
         base=$(basename "$w" .wav)
-        out="$REC_DIR/$base"
-        mkdir -p "$out"
-        # Каждую сторону приводим к одной громкости речи; из неё делаем отдельный файл и общий микс.
+        # Каждую сторону приводим к одной громкости речи; из неё делаем отдельные файлы и общий микс.
         gf=$(gain_for "$(loudness "$w" 0)"); gm=$(gain_for "$(loudness "$w" 1)")
-        if ffmpeg -v error -y -i "$w" -filter_complex \
-                "[0:a]pan=mono|c0=c0,volume=${gf}dB,asplit[f1][f2];[0:a]pan=mono|c0=c1,volume=${gm}dB,asplit[m1][m2];[f1][m1]amix=inputs=2:normalize=0,alimiter=limit=0.97:level=false[mix];[f2]alimiter=limit=0.97:level=false[far];[m2]alimiter=limit=0.97:level=false[me]" \
-                -map "[mix]" -c:a aac -b:a 128k -metadata title="$base — оба голоса" "$out/$base — оба голоса.m4a" \
+        local sides="[0:a]pan=mono|c0=c0,volume=${gf}dB,asplit[f1][f2];[0:a]pan=mono|c0=c1,volume=${gm}dB,asplit[m1][m2]"
+        local mix="[f1][m1]amix=inputs=2:normalize=0,alimiter=limit=0.97:level=false[mix]"
+        local ok=0 saved
+        if split_enabled; then
+            out="$REC_DIR/$base"
+            mkdir -p "$out"
+            saved="$out/$base — оба голоса.m4a"
+            ffmpeg -v error -y -i "$w" -filter_complex \
+                "$sides;$mix;[f2]alimiter=limit=0.97:level=false[far];[m2]alimiter=limit=0.97:level=false[me]" \
+                -map "[mix]" -c:a aac -b:a 128k -metadata title="$base — оба голоса" "$saved" \
                 -map "[me]" -c:a aac -b:a 96k -metadata title="$base — я" "$out/$base — я.m4a" \
-                -map "[far]" -c:a aac -b:a 96k -metadata title="$base — собеседник" "$out/$base — собеседник.m4a"; then
+                -map "[far]" -c:a aac -b:a 96k -metadata title="$base — собеседник" "$out/$base — собеседник.m4a" && ok=1
+        else
+            saved="$REC_DIR/$base.m4a"
+            ffmpeg -v error -y -i "$w" -filter_complex "$sides;$mix;[f2]anullsink;[m2]anullsink" \
+                -map "[mix]" -c:a aac -b:a 128k -metadata title="$base" "$saved" && ok=1
+        fi
+        if [ $ok = 1 ]; then
             rm -f "$w"
-            local secs; secs=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$out/$base — оба голоса.m4a" | cut -d. -f1)
-            echo "✅ Запись сохранена ($((secs / 60)) мин $((secs % 60)) с) в папку:"
-            echo "   $out"
-            echo "   «оба голоса», «я» и «собеседник» — отдельными файлами"
+            local secs; secs=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$saved" | cut -d. -f1)
+            echo "✅ Запись сохранена ($((secs / 60)) мин $((secs % 60)) с):"
+            if split_enabled; then
+                echo "   $out"
+                echo "   «оба голоса», «я» и «собеседник» — отдельными файлами"
+            else
+                echo "   $saved"
+            fi
         else
             echo "❌ Не удалось преобразовать запись, исходный файл оставлен: $w"; exit 1
         fi
@@ -77,11 +98,26 @@ status() {
     else
         echo "Запись не идёт"
     fi
+    if split_enabled; then echo "Голоса сохраняются отдельно: оба / я / собеседник"; else echo "Сохраняется один файл с обоими голосами"; fi
+}
+
+set_split() {
+    local value
+    case "${1:-}" in
+        on|yes) value=yes ;;
+        off|no) value=no ;;
+        *) echo "использование: call-recorder split on | off"; exit 2 ;;
+    esac
+    mkdir -p "$DIR"
+    { grep -v '^split=' "$SETTINGS" 2>/dev/null; echo "split=$value"; } > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
+    if [ $value = yes ]; then echo "✅ Голоса будут сохраняться отдельно: оба / я / собеседник"
+    else echo "✅ Будет сохраняться один файл с обоими голосами"; fi
 }
 
 case "${1:-}" in
     on|start) start ;;
     off|stop) stop ;;
     status) status ;;
-    *) echo "использование: call-recorder on | off | status"; exit 2 ;;
+    split) set_split "${2:-}" ;;
+    *) echo "использование: call-recorder on | off | status | split on|off"; exit 2 ;;
 esac

@@ -9,6 +9,20 @@ let script = home + "/.call-recorder/call-recorder.sh"
 let recDir = home + "/Movies/Записи звонков"
 let currentDir = home + "/.call-recorder/current"   // WAV текущей записи
 let logPath = home + "/.call-recorder/logs/calltap.log"
+let settingsPath = home + "/.call-recorder/settings"   // строки вида split=no; их же читает call-recorder.sh
+
+/// Сохранять ли голоса отдельными файлами; выключается строкой split=no, по умолчанию включено.
+func splitEnabled() -> Bool {
+    let lines = ((try? String(contentsOfFile: settingsPath, encoding: .utf8)) ?? "").split(separator: "\n")
+    return lines.last { $0.hasPrefix("split=") } != "split=no"
+}
+
+func setSplitEnabled(_ on: Bool) {
+    var lines = ((try? String(contentsOfFile: settingsPath, encoding: .utf8)) ?? "")
+        .split(separator: "\n").map(String.init).filter { !$0.hasPrefix("split=") }
+    lines.append("split=" + (on ? "yes" : "no"))
+    try? (lines.joined(separator: "\n") + "\n").write(toFile: settingsPath, atomically: true, encoding: .utf8)
+}
 
 func runningProcessNames() -> Set<String> {
     let n = proc_listallpids(nil, 0)
@@ -62,9 +76,212 @@ func symbol(_ name: String, red: Bool = false) -> NSImage? {
     return img
 }
 
+// MARK: - Окно «Детали»
+
+/// Уровни текущей записи прямо из её WAV: CallTap дописывает файл порциями примерно каждые 0,2 с
+/// (16 бит, канал 1 — собеседник, канал 2 — микрофон), так что шкалам не нужна связь с CallTap.
+final class WavLevelReader {
+    private var url: URL?
+    private var dataStart: UInt64 = 0
+    private var lastSize: UInt64 = 0
+
+    /// Пики каналов (0…1) по данным, дописанным с прошлого вызова (не больше 0,1 с); nil — новых данных нет.
+    func read() -> (far: Float, mic: Float)? {
+        guard let wav = newestFile(in: currentDir, ext: "wav") else { url = nil; return nil }
+        if wav != url { url = wav; dataStart = 0; lastSize = 0 }
+        guard let h = try? FileHandle(forReadingFrom: wav) else { return nil }
+        defer { try? h.close() }
+        if dataStart == 0 { dataStart = findDataStart(h) ?? 0 }
+        guard dataStart > 0, let size = try? h.seekToEnd(), size > max(lastSize, dataStart) else { return nil }
+        var from = max(lastSize, dataStart, size > 19_200 ? size - 19_200 : 0)
+        from = dataStart + (from - dataStart) / 4 * 4
+        lastSize = size
+        guard (try? h.seek(toOffset: from)) != nil, let data = try? h.read(upToCount: Int(size - from)), data.count >= 4 else { return nil }
+        var far: Int32 = 0, mic: Int32 = 0
+        data.withUnsafeBytes { raw in
+            var i = 0
+            while i + 4 <= raw.count {
+                far = max(far, abs(Int32(raw.loadUnaligned(fromByteOffset: i, as: Int16.self))))
+                mic = max(mic, abs(Int32(raw.loadUnaligned(fromByteOffset: i + 2, as: Int16.self))))
+                i += 4
+            }
+        }
+        return (Float(far) / 32768, Float(mic) / 32768)
+    }
+
+    /// Начало звука в WAV: после заголовка RIFF идут блоки (fmt, FLLR, …), нужен блок data.
+    private func findDataStart(_ h: FileHandle) -> UInt64? {
+        guard (try? h.seek(toOffset: 0)) != nil, let head = try? h.read(upToCount: 65_536),
+              head.count > 12, head.prefix(4) == Data("RIFF".utf8) else { return nil }
+        let bytes = [UInt8](head)
+        var off = 12
+        while off + 8 <= bytes.count {
+            let id = String(bytes: bytes[off..<off + 4], encoding: .ascii)
+            if id == "data" { return UInt64(off + 8) }
+            let len = Int(bytes[off + 4]) | Int(bytes[off + 5]) << 8 | Int(bytes[off + 6]) << 16 | Int(bytes[off + 7]) << 24
+            off += 8 + len + (len & 1)
+        }
+        return nil
+    }
+}
+
+/// Горизонтальная шкала от −60 до 0 дБ: зелёная, с −12 дБ жёлтая, с −3 дБ красная; риска — пик за последние 1,5 с.
+final class LevelMeterView: NSView {
+    var level: Float = -60 { didSet { needsDisplay = true } }
+    var peak: Float = -60 { didSet { needsDisplay = true } }
+
+    private func x(_ db: Float) -> CGFloat { bounds.width * CGFloat((max(-60, min(0, db)) + 60) / 60) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let shape = NSBezierPath(roundedRect: bounds, xRadius: 3, yRadius: 3)
+        NSColor.quaternaryLabelColor.setFill()
+        shape.fill()
+        NSGraphicsContext.saveGraphicsState()
+        shape.addClip()
+        let zones: [(Float, Float, NSColor)] = [(-60, -12, .systemGreen), (-12, -3, .systemYellow), (-3, 0, .systemRed)]
+        for (from, to, color) in zones {
+            let a = x(from), b = min(x(to), x(level))
+            if b > a { color.setFill(); NSRect(x: a, y: 0, width: b - a, height: bounds.height).fill() }
+        }
+        if peak > -60 {
+            NSColor.labelColor.withAlphaComponent(0.7).setFill()
+            NSRect(x: max(0, x(peak) - 1), y: 0, width: 2, height: bounds.height).fill()
+        }
+        NSGraphicsContext.restoreGraphicsState()
+    }
+}
+
+/// Небольшое окно поверх остальных: уровни собеседника и микрофона в реальном времени,
+/// кнопка записи и настройка «сохранять голоса отдельно».
+final class DetailsWindow: NSObject, NSWindowDelegate {
+    private unowned let app: AppDelegate
+    private let panel: NSPanel
+    private let status = NSTextField(labelWithString: "")
+    private let farMeter = LevelMeterView(), micMeter = LevelMeterView()
+    private let farValue = NSTextField(labelWithString: ""), micValue = NSTextField(labelWithString: "")
+    private let warning = NSTextField(wrappingLabelWithString: "⚠︎ Микрофон молчит больше 10 секунд — ваш голос не пишется. "
+                                      + "Разрешите CallTap доступ к микрофону в Системных настройках.")
+    private let splitBox = NSButton(checkboxWithTitle: "Сохранять голоса отдельно: «я» и «собеседник»", target: nil, action: nil)
+    private let recordButton = NSButton(title: "", target: nil, action: nil)
+    private let reader = WavLevelReader()
+    private var timer: Timer?
+    private var farHold: (db: Float, at: Date) = (-60, .distantPast)
+    private var micHold: (db: Float, at: Date) = (-60, .distantPast)
+
+    init(app: AppDelegate) {
+        self.app = app
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 400, height: 220),
+                        styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
+        super.init()
+        panel.title = "Запись звонков"
+        panel.isFloatingPanel = true
+        panel.level = .floating
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.delegate = self
+
+        status.font = .boldSystemFont(ofSize: 13)
+        warning.textColor = .systemOrange
+        warning.preferredMaxLayoutWidth = 360
+        splitBox.target = self
+        splitBox.action = #selector(splitChanged)
+        splitBox.toolTip = "Выключите, чтобы сохранять один файл с обоими голосами. Действует при сохранении записи."
+        recordButton.target = self
+        recordButton.action = #selector(recordPressed)
+        recordButton.bezelStyle = .rounded
+        recordButton.keyEquivalent = "\r"
+        let folderButton = NSButton(title: "Открыть папку", target: app, action: #selector(AppDelegate.openFolder))
+        folderButton.bezelStyle = .rounded
+        let separator = NSBox()
+        separator.boxType = .separator
+
+        let stack = NSStackView(views: [status, meterRow("Собеседник", farMeter, farValue), meterRow("Я (микрофон)", micMeter, micValue),
+                                        warning, separator, splitBox, NSStackView(views: [recordButton, folderButton])])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        separator.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
+        panel.contentView = stack
+    }
+
+    private func meterRow(_ title: String, _ meter: LevelMeterView, _ value: NSTextField) -> NSStackView {
+        let label = NSTextField(labelWithString: title)
+        label.widthAnchor.constraint(equalToConstant: 96).isActive = true
+        meter.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        meter.heightAnchor.constraint(equalToConstant: 10).isActive = true
+        value.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        value.textColor = .secondaryLabelColor
+        value.alignment = .right
+        value.widthAnchor.constraint(equalToConstant: 56).isActive = true
+        let row = NSStackView(views: [label, meter, value])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        return row
+    }
+
+    func show() {
+        tick()
+        panel.setContentSize(panel.contentView?.fittingSize ?? panel.frame.size)
+        if !panel.isVisible { panel.center() }
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in self?.tick() }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func tick() {
+        let fresh = app.recording ? reader.read() : nil
+        update(farMeter, farValue, &farHold, fresh.map { $0.far })
+        update(micMeter, micValue, &micHold, fresh.map { $0.mic })
+
+        if app.busy {
+            status.stringValue = "Подождите…"
+            status.textColor = .labelColor
+        } else if app.recording {
+            status.stringValue = "● Идёт запись · " + app.elapsed()
+            status.textColor = .systemRed
+        } else {
+            status.stringValue = "Запись не идёт"
+            status.textColor = .labelColor
+        }
+        let silent = app.recording && micSilent()
+        if warning.isHidden == silent {
+            warning.isHidden = !silent
+            panel.setContentSize(panel.contentView?.fittingSize ?? panel.frame.size)
+        }
+        splitBox.state = splitEnabled() ? .on : .off
+        recordButton.title = app.recording ? "Остановить и сохранить" : "Начать запись"
+        recordButton.isEnabled = !app.busy
+    }
+
+    /// Шкала падает на 30 дБ/с, если громкость снизилась или новых данных нет; риска пика держится 1,5 с.
+    private func update(_ meter: LevelMeterView, _ value: NSTextField, _ hold: inout (db: Float, at: Date), _ peak: Float?) {
+        var db = meter.level - 1.5
+        if let peak, peak > 0 { db = max(db, 20 * log10(peak)) }
+        db = max(-60, min(0, db))
+        meter.level = db
+        if db >= hold.db || Date().timeIntervalSince(hold.at) > 1.5 { hold = (db, Date()) }
+        meter.peak = hold.db
+        value.stringValue = db <= -59.5 ? "—" : String(format: "%.0f дБ", db)
+    }
+
+    @objc private func splitChanged() { setSplitEnabled(splitBox.state == .on) }
+    @objc private func recordPressed() { app.toggle() }
+}
+
+// MARK: - Кнопка в строке меню
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var item: NSStatusItem!
     let menu = NSMenu()
+    lazy var details = DetailsWindow(app: self)
     var busy = false
     var recording = false
     var recordingStart: Date?
@@ -180,16 +397,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         menu.addItem(.separator())
         _ = add(recording ? "Остановить и сохранить" : "Начать запись", #selector(toggle), enabled: !busy)
+        _ = add("Показать детали…", #selector(showDetails))
         menu.addItem(.separator())
         _ = add("Открыть папку с записями", #selector(openFolder))
         _ = add("Показать последнюю запись", #selector(revealLatest), enabled: latestRecording() != nil)
         menu.addItem(.separator())
+        let split = add("Сохранять голоса отдельно (я / собеседник)", #selector(toggleSplit))
+        split.state = splitEnabled() ? .on : .off
         let login = add("Запускать при входе в систему", #selector(toggleLogin))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         _ = add("Убрать кнопку (запись не остановится)", #selector(quit))
     }
 
-    @objc func openFolder() { NSWorkspace.shared.open(URL(fileURLWithPath: recDir)) }
+    @objc func showDetails() { details.show() }
+
+    @objc func toggleSplit() { setSplitEnabled(!splitEnabled()) }
+
+    @objc func openFolder() {
+        try? FileManager.default.createDirectory(atPath: recDir, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(URL(fileURLWithPath: recDir))
+    }
 
     @objc func revealLatest() {
         guard let last = latestRecording() else { return }
