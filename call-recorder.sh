@@ -5,8 +5,8 @@
 #   call-recorder on      — начать запись
 #   call-recorder off     — остановить и сохранить
 #   call-recorder status  — идёт ли запись
-# Записи: ~/Movies/Записи звонков/«Звонок ….m4a» — оба голоса, выровненные по громкости;
-#         в подпапке «Дорожки» — «Звонок ….mka» с собеседником и вами на отдельных дорожках (без выравнивания).
+# Записи: ~/Movies/Записи звонков/«Звонок <дата время>»/ — папка на каждый звонок с тремя файлами:
+#         «… — оба голоса.m4a», «… — я.m4a», «… — собеседник.m4a» (громкость выровнена).
 set -u
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 DIR="$HOME/.call-recorder"
@@ -17,6 +17,9 @@ CUR="$DIR/current"   # здесь лежит WAV, пока идёт запись
 REC_DIR="$HOME/Movies/Записи звонков"
 
 recording() { pgrep -f "$BIN record" >/dev/null; }
+# Микрофон молчит: CallTap пишет уровни через 3 с и дальше раз в 10 с; первые секунды AirPods ещё
+# переключаются в режим гарнитуры, поэтому смотрим только на последнюю строку после первой.
+mic_silent() { [ "$(grep -c "уровень" "$LOG" 2>/dev/null)" -ge 2 ] && grep "уровень" "$LOG" | tail -1 | grep -q "микрофон   -inf"; }
 
 # Громкость речи на канале WAV (0 — собеседник, 1 — микрофон), LUFS по EBU R128.
 loudness() { ffmpeg -nostats -i "$1" -af "pan=mono|c0=c$2,ebur128" -f null - 2>&1 | awk '/^ +I:/ {v=$2} END {print v}'; }
@@ -33,14 +36,7 @@ start() {
     open -n -g "$APP" --stdout "$LOG" --stderr "$LOG" --args record "$CUR/$name.wav"
     for _ in $(seq 1 20); do grep -qE "запись идёт|❌" "$LOG" && break; sleep 0.25; done
     if ! recording || ! grep -q "запись идёт" "$LOG"; then echo "❌ Запись не началась:"; cat "$LOG"; exit 1; fi
-    # Через 3 с CallTap пишет первые уровни; полная тишина микрофона значит, что нет доступа к нему.
-    for _ in $(seq 1 20); do grep -q "уровень" "$LOG" && break; sleep 0.25; done
     echo "✅ Идёт запись: $name"
-    if grep "уровень" "$LOG" | head -1 | grep -q "микрофон   -inf"; then
-        echo "⚠️  Микрофон пишет тишину. Если macOS спросила про доступ CallTap к микрофону — нажмите «Разрешить»,"
-        echo "   затем остановите и снова начните запись."
-        exit 3
-    fi
 }
 
 stop() {
@@ -48,24 +44,25 @@ stop() {
         pkill -TERM -f "$BIN record"
         for _ in $(seq 1 40); do recording || break; sleep 0.25; done
     fi
-    local found=0 w base gf gm
-    mkdir -p "$REC_DIR/Дорожки"
+    local found=0 w base out gf gm
     for w in "$CUR"/*.wav; do
         [ -f "$w" ] || continue
         found=1
         base=$(basename "$w" .wav)
-        # Выравниваем голоса: каждую сторону приводим к одной громкости речи, потом смешиваем.
+        out="$REC_DIR/$base"
+        mkdir -p "$out"
+        # Каждую сторону приводим к одной громкости речи; из неё делаем отдельный файл и общий микс.
         gf=$(gain_for "$(loudness "$w" 0)"); gm=$(gain_for "$(loudness "$w" 1)")
         if ffmpeg -v error -y -i "$w" -filter_complex \
-                "[0:a]pan=mono|c0=c0,volume=${gf}dB[far];[0:a]pan=mono|c0=c1,volume=${gm}dB[me];[far][me]amix=inputs=2:normalize=0,alimiter=limit=0.97:level=false" \
-                -c:a aac -b:a 128k "$REC_DIR/$base.m4a" &&
-           ffmpeg -v error -y -i "$w" -filter_complex "[0:a]pan=mono|c0=c0[far];[0:a]pan=mono|c0=c1[me]" \
-                -map "[far]" -map "[me]" -c:a aac -b:a 96k \
-                -metadata:s:a:0 title="Собеседник" -metadata:s:a:1 title="Я (микрофон)" "$REC_DIR/Дорожки/$base.mka"; then
+                "[0:a]pan=mono|c0=c0,volume=${gf}dB,asplit[f1][f2];[0:a]pan=mono|c0=c1,volume=${gm}dB,asplit[m1][m2];[f1][m1]amix=inputs=2:normalize=0,alimiter=limit=0.97:level=false[mix];[f2]alimiter=limit=0.97:level=false[far];[m2]alimiter=limit=0.97:level=false[me]" \
+                -map "[mix]" -c:a aac -b:a 128k -metadata title="$base — оба голоса" "$out/$base — оба голоса.m4a" \
+                -map "[me]" -c:a aac -b:a 96k -metadata title="$base — я" "$out/$base — я.m4a" \
+                -map "[far]" -c:a aac -b:a 96k -metadata title="$base — собеседник" "$out/$base — собеседник.m4a"; then
             rm -f "$w"
-            local secs; secs=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$REC_DIR/$base.m4a" | cut -d. -f1)
-            echo "✅ Запись сохранена ($((secs / 60)) мин $((secs % 60)) с):"
-            echo "   $REC_DIR/$base.m4a"
+            local secs; secs=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$out/$base — оба голоса.m4a" | cut -d. -f1)
+            echo "✅ Запись сохранена ($((secs / 60)) мин $((secs % 60)) с) в папку:"
+            echo "   $out"
+            echo "   «оба голоса», «я» и «собеседник» — отдельными файлами"
         else
             echo "❌ Не удалось преобразовать запись, исходный файл оставлен: $w"; exit 1
         fi
@@ -74,7 +71,12 @@ stop() {
 }
 
 status() {
-    if recording; then echo "Идёт запись — $(tail -1 "$LOG")"; else echo "Запись не идёт"; fi
+    if recording; then
+        echo "Идёт запись — $(grep "уровень" "$LOG" | tail -1)"
+        if mic_silent; then echo "⚠️  Микрофон молчит: разрешите CallTap доступ к микрофону (Системные настройки → Конфиденциальность и безопасность → Микрофон)"; fi
+    else
+        echo "Запись не идёт"
+    fi
 }
 
 case "${1:-}" in

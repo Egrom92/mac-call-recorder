@@ -8,6 +8,7 @@ let home = FileManager.default.homeDirectoryForCurrentUser.path
 let script = home + "/.call-recorder/call-recorder.sh"
 let recDir = home + "/Movies/Записи звонков"
 let currentDir = home + "/.call-recorder/current"   // WAV текущей записи
+let logPath = home + "/.call-recorder/logs/calltap.log"
 
 func runningProcessNames() -> Set<String> {
     let n = proc_listallpids(nil, 0)
@@ -33,7 +34,23 @@ func newestFile(in dir: String, ext: String) -> URL? {
     return urls.filter { $0.pathExtension == ext }.max { creationDate($0) < creationDate($1) }
 }
 
-func latestRecording() -> URL? { newestFile(in: recDir, ext: "m4a") }
+func isDirectory(_ url: URL) -> Bool { (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false }
+
+/// Последняя запись: папка звонка или .m4a в корне (так сохранялись записи до разделения на три файла).
+func latestRecording() -> URL? {
+    let urls = (try? FileManager.default.contentsOfDirectory(
+        at: URL(fileURLWithPath: recDir), includingPropertiesForKeys: [.creationDateKey, .isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
+    return urls.filter { $0.lastPathComponent.hasPrefix("Звонок") && (isDirectory($0) || $0.pathExtension == "m4a") }
+        .max { creationDate($0) < creationDate($1) }
+}
+
+/// Микрофон молчит: CallTap пишет уровни через 3 с и дальше раз в 10 с; первые секунды AirPods ещё
+/// переключаются в режим гарнитуры, поэтому тревожимся, только если молчит и последняя строка после первой.
+func micSilent() -> Bool {
+    guard let text = try? String(contentsOfFile: logPath, encoding: .utf8) else { return false }
+    let levels = text.split(separator: "\n").filter { $0.contains("уровень") }
+    return levels.count >= 2 && levels.last?.contains("микрофон   -inf") == true
+}
 
 func symbol(_ name: String, red: Bool = false) -> NSImage? {
     guard let img = NSImage(systemSymbolName: name, accessibilityDescription: "Запись звонков") else { return nil }
@@ -129,9 +146,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             b.title = ""
             b.toolTip = "Запись звонков: подождите…"
         } else if recording {
+            let silent = micSilent()
             b.image = symbol("record.circle.fill", red: true)
-            b.title = " " + elapsed()
-            b.toolTip = "Идёт запись звонка. Клик — остановить и сохранить"
+            b.title = " " + elapsed() + (silent ? " ⚠︎" : "")
+            b.toolTip = silent ? "Идёт запись, но микрофон молчит — разрешите CallTap доступ к микрофону (правый клик → меню)"
+                               : "Идёт запись звонка. Клик — остановить и сохранить"
         } else {
             b.image = symbol("record.circle")
             b.title = ""
@@ -155,6 +174,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return mi
         }
         _ = add(recording ? "Идёт запись · \(elapsed())" : "Запись не идёт", nil)
+        if recording && micSilent() {
+            _ = add("⚠︎ Микрофон молчит — ваш голос не пишется", nil)
+            _ = add("Открыть настройки доступа к микрофону…", #selector(openMicSettings))
+        }
         menu.addItem(.separator())
         _ = add(recording ? "Остановить и сохранить" : "Начать запись", #selector(toggle), enabled: !busy)
         menu.addItem(.separator())
@@ -169,8 +192,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func openFolder() { NSWorkspace.shared.open(URL(fileURLWithPath: recDir)) }
 
     @objc func revealLatest() {
-        guard let m4a = latestRecording() else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([m4a])
+        guard let last = latestRecording() else { return }
+        if isDirectory(last) { NSWorkspace.shared.open(last) } else { NSWorkspace.shared.activateFileViewerSelecting([last]) }
+    }
+
+    @objc func openMicSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     @objc func toggleLogin() {
