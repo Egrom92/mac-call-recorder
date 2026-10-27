@@ -40,7 +40,8 @@ start() {
     : > "$LOG"
     local name; name="Звонок $(date '+%Y-%m-%d %H-%M-%S')"
     open -n -g "$APP" --stdout "$LOG" --stderr "$LOG" --args record "$CUR/$name.wav"
-    for _ in $(seq 1 20); do grep -qE "запись идёт|❌" "$LOG" && break; sleep 0.25; done
+    # CallTap может повторить запуск, если AirPods как раз переключаются в режим гарнитуры, — ждём до 10 с.
+    for _ in $(seq 1 40); do grep -qE "запись идёт|❌" "$LOG" && break; sleep 0.25; done
     if ! recording || ! grep -q "запись идёт" "$LOG"; then echo "❌ Запись не началась:"; cat "$LOG"; exit 1; fi
     echo "✅ Идёт запись: $name"
 }
@@ -50,11 +51,17 @@ stop() {
         pkill -TERM -f "$BIN record"
         for _ in $(seq 1 40); do recording || break; sleep 0.25; done
     fi
-    local found=0 w base out gf gm
+    local found=0 empty=0 w base out gf gm dur
     for w in "$CUR"/*.wav; do
         [ -f "$w" ] || continue
         found=1
         base=$(basename "$w" .wav)
+        dur=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$w" 2>/dev/null | cut -d. -f1)
+        if ! [ "${dur:-0}" -ge 1 ] 2>/dev/null; then
+            rm -f "$w"; empty=1
+            echo "⚠️ Запись «$base» пустая: звук не поступал. Начните запись ещё раз."
+            continue
+        fi
         # Каждую сторону приводим к одной громкости речи; из неё делаем отдельные файлы и общий микс.
         gf=$(gain_for "$(loudness "$w" 0)"); gm=$(gain_for "$(loudness "$w" 1)")
         local sides="[0:a]pan=mono|c0=c0,volume=${gf}dB,asplit[f1][f2];[0:a]pan=mono|c0=c1,volume=${gm}dB,asplit[m1][m2]"
@@ -89,6 +96,7 @@ stop() {
         fi
     done
     [ $found = 1 ] || echo "Запись не шла"
+    [ $empty = 0 ] || exit 4
 }
 
 status() {

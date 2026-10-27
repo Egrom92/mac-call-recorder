@@ -232,7 +232,10 @@ final class TapCapture {
 
 /// Пишет WAV с двумя каналами: 1 — собеседник (общий tap звука Mac), 2 — микрофон.
 /// Tap и микрофон собраны в одно aggregate-устройство с часами BlackHole, поэтому идут синхронно.
+/// Если устройство перестаёт отдавать звук (AirPods в этот момент переключили режим или переподключились),
+/// его пересоздают через restart(), а запись продолжается в тот же файл.
 final class CallRecorder {
+    private let exclude: [AudioObjectID]
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggID = AudioObjectID(kAudioObjectUnknown)
     private var ioProc: AudioDeviceIOProcID?
@@ -241,16 +244,39 @@ final class CallRecorder {
     private let frames = UnsafeMutablePointer<Float>.allocate(capacity: 2 * 16384)
     private var farPeak: Float = 0
     private var micPeak: Float = 0
+    /// Сколько кадров записано: растёт в аудиопотоке, сторож в runRecord читает его раз в секунду.
+    private(set) var framesWritten = 0
     private(set) var info = ""
 
     init?(path: String, micUID: String, exclude: [AudioObjectID]) {
+        self.exclude = exclude
+        guard let rate = startCapture(micUID: micUID) else { stopCapture(); return nil }
+        var client = AudioStreamBasicDescription(
+            mSampleRate: rate, mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: 8, mFramesPerPacket: 1, mBytesPerFrame: 8, mChannelsPerFrame: 2, mBitsPerChannel: 32, mReserved: 0)
+        var fileFormat = AudioStreamBasicDescription(
+            mSampleRate: rate, mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked,
+            mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4, mChannelsPerFrame: 2, mBitsPerChannel: 16, mReserved: 0)
+        guard ExtAudioFileCreateWithURL(URL(fileURLWithPath: path) as CFURL, kAudioFileWAVEType, &fileFormat, nil,
+                                        AudioFileFlags.eraseFile.rawValue, &file) == noErr, let file else {
+            log("⚠️ не удалось создать файл \(path)"); stopCapture(); return nil
+        }
+        ExtAudioFileSetProperty(file, kExtAudioFileProperty_ClientDataFormat, UInt32(MemoryLayout<AudioStreamBasicDescription>.size), &client)
+        ExtAudioFileWriteAsync(file, 0, nil)
+        guard startIO() else { stop(); return nil }
+    }
+
+    /// Создаёт tap и aggregate (BlackHole — часы, микрофон, tap) и возвращает частоту устройства; звук ещё не идёт.
+    private func startCapture(micUID: String) -> Float64? {
         let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: exclude)
         desc.uuid = UUID()
         desc.name = "CallTap record"
         desc.isPrivate = true
         desc.muteBehavior = .unmuted
         var st = AudioHardwareCreateProcessTap(desc, &tapID)
-        guard st == noErr else { log("❌ не удалось создать tap: \(st)"); return nil }
+        guard st == noErr else { log("⚠️ не удалось создать tap: \(st)"); return nil }
         let aggDesc: [String: Any] = [
             kAudioAggregateDeviceNameKey: "CallTap record",
             kAudioAggregateDeviceUIDKey: "CallTap-\(UUID().uuidString)",
@@ -265,7 +291,7 @@ final class CallRecorder {
             kAudioAggregateDeviceTapListKey: [[kAudioSubTapDriftCompensationKey: true, kAudioSubTapUIDKey: desc.uuid.uuidString]],
         ]
         st = AudioHardwareCreateAggregateDevice(aggDesc as CFDictionary, &aggID)
-        guard st == noErr else { log("❌ не удалось создать aggregate: \(st)"); stop(); return nil }
+        guard st == noErr else { log("⚠️ не удалось создать aggregate: \(st)"); return nil }
         Thread.sleep(forTimeInterval: 0.3)
 
         let rate = getValue(aggID, kAudioDevicePropertyNominalSampleRate, Float64(0)) ?? 48000
@@ -273,29 +299,25 @@ final class CallRecorder {
             .map { getValue($0, kAudioStreamPropertyVirtualFormat, AudioStreamBasicDescription()) }
         info = "rate=\(Int(rate)) in=\(inFormats.map(formatString))"
         // Потоки входа: BlackHole, микрофон, tap.
-        guard inFormats.count >= 3 else { log("❌ в aggregate нет потока микрофона (\(info))"); stop(); return nil }
+        guard inFormats.count >= 3 else { log("⚠️ в aggregate нет потока микрофона (\(info))"); return nil }
+        return rate
+    }
 
-        var client = AudioStreamBasicDescription(
-            mSampleRate: rate, mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
-            mBytesPerPacket: 8, mFramesPerPacket: 1, mBytesPerFrame: 8, mChannelsPerFrame: 2, mBitsPerChannel: 32, mReserved: 0)
-        var fileFormat = AudioStreamBasicDescription(
-            mSampleRate: rate, mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked,
-            mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4, mChannelsPerFrame: 2, mBitsPerChannel: 16, mReserved: 0)
-        guard ExtAudioFileCreateWithURL(URL(fileURLWithPath: path) as CFURL, kAudioFileWAVEType, &fileFormat, nil,
-                                        AudioFileFlags.eraseFile.rawValue, &file) == noErr, let file else {
-            log("❌ не удалось создать файл \(path)"); stop(); return nil
-        }
-        ExtAudioFileSetProperty(file, kExtAudioFileProperty_ClientDataFormat, UInt32(MemoryLayout<AudioStreamBasicDescription>.size), &client)
-        ExtAudioFileWriteAsync(file, 0, nil)
-
-        st = AudioDeviceCreateIOProcIDWithBlock(&ioProc, aggID, nil) { [unowned self] _, inData, _, outData, _ in
+    private func startIO() -> Bool {
+        var st = AudioDeviceCreateIOProcIDWithBlock(&ioProc, aggID, nil) { [unowned self] _, inData, _, outData, _ in
             self.render(inData, outData)
         }
-        guard st == noErr else { log("❌ не удалось создать IOProc: \(st)"); stop(); return nil }
+        guard st == noErr else { log("⚠️ не удалось создать IOProc: \(st)"); return false }
         st = AudioDeviceStart(aggID, ioProc)
-        guard st == noErr else { log("❌ не удалось запустить запись: \(st)"); stop(); return nil }
+        guard st == noErr else { log("⚠️ не удалось запустить захват: \(st)"); return false }
+        return true
+    }
+
+    /// Пересоздаёт tap и aggregate и снова запускает захват; WAV остаётся тем же.
+    func restart(micUID: String) -> Bool {
+        stopCapture()
+        guard startCapture(micUID: micUID) != nil, startIO() else { stopCapture(); return false }
+        return true
     }
 
     private func render(_ inData: UnsafePointer<AudioBufferList>, _ outData: UnsafeMutablePointer<AudioBufferList>) {
@@ -318,6 +340,7 @@ final class CallRecorder {
         farPeak = max(farPeak, fp); micPeak = max(micPeak, mp)
         var abl = AudioBufferList(mNumberBuffers: 1, mBuffers: AudioBuffer(mNumberChannels: 2, mDataByteSize: UInt32(n * 8), mData: frames))
         ExtAudioFileWriteAsync(file, UInt32(n), &abl)
+        framesWritten += n
     }
 
     func takePeaks() -> (far: Float, mic: Float) {
@@ -326,11 +349,15 @@ final class CallRecorder {
         return r
     }
 
-    func stop() {
+    private func stopCapture() {
         if let ioProc { AudioDeviceStop(aggID, ioProc); AudioDeviceDestroyIOProcID(aggID, ioProc) }
         ioProc = nil
         if aggID != kAudioObjectUnknown { AudioHardwareDestroyAggregateDevice(aggID); aggID = kAudioObjectUnknown }
         if tapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tapID); tapID = kAudioObjectUnknown }
+    }
+
+    func stop() {
+        stopCapture()
         if let file { ExtAudioFileDispose(file) }
         file = nil
     }
@@ -381,17 +408,31 @@ func runBridge() {
 
 var keepAlive: [AnyObject] = []
 
-func runRecord(path: String) {
+/// Микрофон для записи — AirPods, если подключены, иначе системный вход по умолчанию.
+func findMic() -> Device? {
     let devices = allDevices()
-    guard devices.contains(where: { $0.uid == blackHoleUID }) else { log("❌ BlackHole 2ch не найден"); exit(1) }
-    // Микрофон — AirPods, если подключены, иначе системный вход по умолчанию.
     let defaultIn = defaultDevice(kAudioHardwarePropertyDefaultInputDevice)
-    guard let mic = devices.first(where: { $0.name.contains("AirPods") && hasStreams($0.id, kAudioObjectPropertyScopeInput) })
-        ?? devices.first(where: { $0.id == defaultIn }) else { log("❌ микрофон не найден"); exit(1) }
+    return devices.first(where: { $0.name.contains("AirPods") && hasStreams($0.id, kAudioObjectPropertyScopeInput) })
+        ?? devices.first(where: { $0.id == defaultIn })
+}
+
+func runRecord(path: String) {
+    guard allDevices().contains(where: { $0.uid == blackHoleUID }) else { log("❌ BlackHole 2ch не найден"); exit(1) }
     let exclude = processObject(getpid()).map { [$0] } ?? []
-    guard let rec = CallRecorder(path: path, micUID: mic.uid, exclude: exclude) else { exit(1) }
-    log("✅ запись идёт: собеседник (звук Mac) + микрофон «\(mic.name)» → \(path) (\(rec.info))")
+    // AirPods в момент запуска могут переключаться в режим гарнитуры — тогда первая попытка не удаётся.
+    var recorder: CallRecorder?
+    var micName = ""
+    for attempt in 1...3 {
+        guard let mic = findMic() else { log("❌ микрофон не найден"); exit(1) }
+        micName = mic.name
+        recorder = CallRecorder(path: path, micUID: mic.uid, exclude: exclude)
+        if recorder != nil { break }
+        if attempt < 3 { Thread.sleep(forTimeInterval: 1.5) }
+    }
+    guard let rec = recorder else { log("❌ не удалось начать запись"); exit(1) }
+    log("✅ запись идёт: собеседник (звук Mac) + микрофон «\(micName)» → \(path) (\(rec.info))")
     onTerminate { rec.stop(); log("запись остановлена") }
+
     var first = true
     let timer = DispatchSource.makeTimerSource(queue: .main)
     timer.schedule(deadline: .now() + 3, repeating: 10)
@@ -402,6 +443,24 @@ func runRecord(path: String) {
     }
     timer.resume()
     keepAlive.append(timer)
+
+    // Сторож: если кадры не поступают (на старте 5 с, дальше 3 с), устройство захвата пересоздаётся.
+    // Так бывает, когда AirPods при запуске переключаются в режим гарнитуры или переподключаются посреди записи.
+    var lastFrames = 0, lastProgress = Date(), started = false
+    let watchdog = DispatchSource.makeTimerSource(queue: .main)
+    watchdog.schedule(deadline: .now() + 1, repeating: 1)
+    watchdog.setEventHandler {
+        let written = rec.framesWritten
+        if written != lastFrames { lastFrames = written; lastProgress = Date(); started = true; return }
+        let stalled = Date().timeIntervalSince(lastProgress)
+        guard stalled >= (started ? 3 : 5) else { return }
+        let mic = findMic()
+        log("⚠️ звук не поступает \(Int(stalled)) с — перезапускаю захват" + (mic.map { " (микрофон «\($0.name)»)" } ?? ""))
+        if let mic, rec.restart(micUID: mic.uid) { log("✅ захват перезапущен") } else { log("⚠️ перезапустить не удалось, попробую ещё раз") }
+        lastProgress = Date()
+    }
+    watchdog.resume()
+    keepAlive.append(watchdog)
 }
 
 func runDiag(seconds: Int, dir: String) {
