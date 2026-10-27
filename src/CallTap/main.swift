@@ -12,6 +12,8 @@ setvbuf(stdout, nil, _IOLBF, 0)
 
 let sys = AudioObjectID(kAudioObjectSystemObject)
 let blackHoleUID = "BlackHole2ch_UID"
+// В aggregate-устройствах намеренно нет kAudioAggregateDeviceTapAutoStartKey: с ним AudioDeviceStart ждёт,
+// пока какое-нибудь приложение не начнёт выводить звук, и пока Mac молчит, не пишется ничего — даже микрофон.
 let obsBundleID = "com.obsproject.obs-studio"
 
 let timeFormatter: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f }()
@@ -132,7 +134,6 @@ final class TapCapture {
             kAudioAggregateDeviceMainSubDeviceKey: clockUID,
             kAudioAggregateDeviceIsPrivateKey: true,
             kAudioAggregateDeviceIsStackedKey: false,
-            kAudioAggregateDeviceTapAutoStartKey: true,
             kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: clockUID]],
             kAudioAggregateDeviceTapListKey: [[kAudioSubTapDriftCompensationKey: true, kAudioSubTapUIDKey: desc.uuid.uuidString]],
         ]
@@ -283,7 +284,6 @@ final class CallRecorder {
             kAudioAggregateDeviceMainSubDeviceKey: blackHoleUID,
             kAudioAggregateDeviceIsPrivateKey: true,
             kAudioAggregateDeviceIsStackedKey: false,
-            kAudioAggregateDeviceTapAutoStartKey: true,
             kAudioAggregateDeviceSubDeviceListKey: [
                 [kAudioSubDeviceUIDKey: blackHoleUID],
                 [kAudioSubDeviceUIDKey: micUID, kAudioSubDeviceDriftCompensationKey: true],
