@@ -58,6 +58,11 @@ func latestRecording() -> URL? {
         .max { creationDate($0) < creationDate($1) }
 }
 
+/// CallTap не дождался звука от AirPods и пишет встроенный микрофон Mac.
+func micFallback() -> Bool {
+    ((try? String(contentsOfFile: logPath, encoding: .utf8)) ?? "").contains("пишу встроенный микрофон")
+}
+
 /// Микрофон молчит: CallTap пишет уровни через 3 с и дальше раз в 10 с; первые секунды AirPods ещё
 /// переключаются в режим гарнитуры, поэтому тревожимся, только если молчит и последняя строка после первой.
 func micSilent() -> Bool {
@@ -258,6 +263,8 @@ final class DetailsWindow: NSObject, NSWindowDelegate {
         let text: String
         if app.recording && started && Date().timeIntervalSince(lastData) > 4 {
             text = "⚠︎ Звук не поступает — CallTap перезапускает захват. Если это не проходит, остановите и начните запись снова."
+        } else if app.recording && micFallback() {
+            text = "⚠︎ Микрофон AirPods не запустился — ваш голос записывается встроенным микрофоном Mac. Чтобы вернуть AirPods, остановите запись, положите наушники в кейс на 15 секунд и начните снова."
         } else if app.recording && micSilent() {
             text = "⚠︎ Микрофон молчит больше 10 секунд — ваш голос не пишется. Разрешите CallTap доступ к микрофону в Системных настройках."
         } else {
