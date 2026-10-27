@@ -159,14 +159,14 @@ final class DetailsWindow: NSObject, NSWindowDelegate {
     private let status = NSTextField(labelWithString: "")
     private let farMeter = LevelMeterView(), micMeter = LevelMeterView()
     private let farValue = NSTextField(labelWithString: ""), micValue = NSTextField(labelWithString: "")
-    private let warning = NSTextField(wrappingLabelWithString: "⚠︎ Микрофон молчит больше 10 секунд — ваш голос не пишется. "
-                                      + "Разрешите CallTap доступ к микрофону в Системных настройках.")
+    private let warning = NSTextField(wrappingLabelWithString: "")
     private let splitBox = NSButton(checkboxWithTitle: "Сохранять голоса отдельно: «я» и «собеседник»", target: nil, action: nil)
     private let recordButton = NSButton(title: "", target: nil, action: nil)
     private let reader = WavLevelReader()
     private var timer: Timer?
     private var farHold: (db: Float, at: Date) = (-60, .distantPast)
     private var micHold: (db: Float, at: Date) = (-60, .distantPast)
+    private var lastData = Date.distantPast
 
     init(app: AppDelegate) {
         self.app = app
@@ -182,7 +182,7 @@ final class DetailsWindow: NSObject, NSWindowDelegate {
 
         status.font = .boldSystemFont(ofSize: 13)
         warning.textColor = .systemOrange
-        warning.preferredMaxLayoutWidth = 360
+        warning.preferredMaxLayoutWidth = 388
         splitBox.target = self
         splitBox.action = #selector(splitChanged)
         splitBox.toolTip = "Выключите, чтобы сохранять один файл с обоими голосами. Действует при сохранении записи."
@@ -201,6 +201,7 @@ final class DetailsWindow: NSObject, NSWindowDelegate {
         stack.alignment = .leading
         stack.spacing = 12
         stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        stack.widthAnchor.constraint(greaterThanOrEqualToConstant: 420).isActive = true
         separator.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
         panel.contentView = stack
     }
@@ -223,7 +224,7 @@ final class DetailsWindow: NSObject, NSWindowDelegate {
 
     func show() {
         tick()
-        panel.setContentSize(panel.contentView?.fittingSize ?? panel.frame.size)
+        fitToContent()
         if !panel.isVisible { panel.center() }
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
@@ -238,6 +239,7 @@ final class DetailsWindow: NSObject, NSWindowDelegate {
 
     private func tick() {
         let fresh = app.recording ? reader.read() : nil
+        if fresh != nil { lastData = Date() }
         update(farMeter, farValue, &farHold, fresh.map { $0.far })
         update(micMeter, micValue, &micHold, fresh.map { $0.mic })
 
@@ -251,14 +253,30 @@ final class DetailsWindow: NSObject, NSWindowDelegate {
             status.stringValue = "Запись не идёт"
             status.textColor = .labelColor
         }
-        let silent = app.recording && micSilent()
-        if warning.isHidden == silent {
-            warning.isHidden = !silent
-            panel.setContentSize(panel.contentView?.fittingSize ?? panel.frame.size)
+        // Файл записи не растёт — звук не поступает (CallTap в это время сам перезапускает захват).
+        let started = app.recordingStart.map { Date().timeIntervalSince($0) > 6 } ?? false
+        let text: String
+        if app.recording && started && Date().timeIntervalSince(lastData) > 4 {
+            text = "⚠︎ Звук не поступает — CallTap перезапускает захват. Если это не проходит, остановите и начните запись снова."
+        } else if app.recording && micSilent() {
+            text = "⚠︎ Микрофон молчит больше 10 секунд — ваш голос не пишется. Разрешите CallTap доступ к микрофону в Системных настройках."
+        } else {
+            text = ""
+        }
+        if warning.stringValue != text || warning.isHidden != text.isEmpty {
+            warning.stringValue = text
+            warning.isHidden = text.isEmpty
+            fitToContent()
         }
         splitBox.state = splitEnabled() ? .on : .off
         recordButton.title = app.recording ? "Остановить и сохранить" : "Начать запись"
         recordButton.isEnabled = !app.busy
+    }
+
+    private func fitToContent() {
+        guard let content = panel.contentView else { return }
+        content.layoutSubtreeIfNeeded()
+        panel.setContentSize(content.fittingSize)
     }
 
     /// Шкала падает на 30 дБ/с, если громкость снизилась или новых данных нет; риска пика держится 1,5 с.
