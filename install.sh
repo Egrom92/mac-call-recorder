@@ -86,8 +86,16 @@ plist() {   # $1 — путь к .app, остальное — строки <key>
     codesign --force --sign - "$app" 2>/dev/null
 }
 
-say "Собираю CallTap (захват звука)"
 mkdir -p "$DIR/logs" "$DIR/current"
+# Каждая пересборка меняет подпись CallTap, и macOS заново спрашивает разрешения, поэтому
+# пересобираем его, только если изменился исходник.
+calltap_hash=$(shasum -a 256 "$SRC/src/CallTap/main.swift" | cut -d' ' -f1)
+CALLTAP_BUILT=0
+if [ -x "$CALLTAP_APP/Contents/MacOS/CallTap" ] && [ "$(cat "$DIR/.calltap-source.sha256" 2>/dev/null)" = "$calltap_hash" ]; then
+    say "CallTap не изменился — оставляю как есть (разрешения macOS сохранятся)"
+else
+say "Собираю CallTap (захват звука)"
+CALLTAP_BUILT=1
 build "$SRC/src/CallTap/main.swift" "$CALLTAP_APP" CallTap 14.4
 plist "$CALLTAP_APP" \
     '<key>CFBundleIdentifier</key><string>local.call-recorder.calltap</string>' \
@@ -100,6 +108,8 @@ plist "$CALLTAP_APP" \
     '<key>LSUIElement</key><true/>' \
     '<key>NSAudioCaptureUsageDescription</key><string>CallTap записывает голос собеседника во время звонка.</string>' \
     '<key>NSMicrophoneUsageDescription</key><string>CallTap записывает ваш голос с микрофона во время звонка.</string>'
+echo "$calltap_hash" > "$DIR/.calltap-source.sha256"
+fi
 
 say "Собираю кнопку «Запись звонков» для строки меню"
 pkill -f "Запись звонков.app/Contents/MacOS/CallRecorderMenu" 2>/dev/null || true
@@ -120,25 +130,32 @@ ln -sf "$DIR/call-recorder.sh" "$(brew --prefix)/bin/call-recorder"
 # --- 6. Проверка BlackHole и разрешений ----------------------------------------
 if ! system_profiler SPAudioDataType 2>/dev/null | grep -q "BlackHole 2ch"; then
     say "BlackHole 2ch пока не виден системе — перезагрузите Mac, и всё заработает."
-else
-    # Первый запуск CallTap (и первый после обновления) показывает окна разрешений; пока они открыты,
-    # запись не стартует — поэтому ждём до 30 секунд.
-    say "Проверяю запись. macOS спросит доступ CallTap к микрофону и к записи системного звука — нажмите «Разрешить» (жду до 30 секунд)."
+elif [ "$CALLTAP_BUILT" = 1 ]; then
+    # Первый запуск свежесобранного CallTap показывает окна разрешений; пока они открыты, запись не стартует.
+    # Первые секунды микрофон AirPods молчит (переключается в режим гарнитуры), поэтому судим по второй
+    # строке уровней — она появляется через 13 секунд.
+    say "Проверяю запись (около 15 секунд). macOS спросит доступ CallTap к микрофону и к записи системного звука — нажмите «Разрешить»."
     test_log="$DIR/logs/install-check.log"; : > "$test_log"
     open -n -g "$CALLTAP_APP" --stdout "$test_log" --stderr "$test_log" --args record "$DIR/logs/install-check.wav"
-    for _ in $(seq 1 60); do grep -qE "уровень|❌" "$test_log" && break; sleep 0.5; done
+    for _ in $(seq 1 90); do
+        [ "$(grep -c "уровень" "$test_log")" -ge 2 ] && break
+        grep -q "❌" "$test_log" && break
+        sleep 0.5
+    done
     pkill -TERM -f "$CALLTAP_APP/Contents/MacOS/CallTap record" 2>/dev/null || true
     sleep 1
     rm -f "$DIR/logs/install-check.wav"
-    if grep -q "уровень" "$test_log"; then
-        grep "уровень" "$test_log" | head -1 | sed 's/^/   /'
-        if grep "уровень" "$test_log" | head -1 | grep -q "микрофон   -inf"; then
-            echo "   Микрофон пишет тишину: проверьте, что CallTap разрешён в Системных настройках →"
-            echo "   Конфиденциальность и безопасность → Микрофон."
+    if [ "$(grep -c "уровень" "$test_log")" -ge 2 ]; then
+        grep "уровень" "$test_log" | tail -1 | sed 's/^/   /'
+        if grep "уровень" "$test_log" | tail -1 | grep -q "микрофон   -inf"; then
+            echo "   Микрофон пишет тишину: разрешите CallTap в Системных настройках →"
+            echo "   Конфиденциальность и безопасность → Микрофон (если уже разрешён — выключите и включите снова)."
+        else
+            echo "   ✓ запись работает"
         fi
     else
-        echo "⚠️  Проверка не дождалась начала записи. Если окна разрешений ещё открыты — нажмите «Разрешить»;"
-        echo "   потом запустите запись кнопкой и проверьте файл. Журнал проверки:"
+        echo "⚠️  Проверка не дождалась записи. Если окна разрешений ещё открыты — нажмите «Разрешить»,"
+        echo "   потом запишите пробу кнопкой. Журнал проверки:"
         sed 's/^/   /' "$test_log"
     fi
 fi
