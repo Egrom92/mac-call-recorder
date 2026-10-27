@@ -40,8 +40,8 @@ start() {
     : > "$LOG"
     local name; name="Звонок $(date '+%Y-%m-%d %H-%M-%S')"
     open -n -g "$APP" --stdout "$LOG" --stderr "$LOG" --args record "$CUR/$name.wav"
-    # CallTap может повторить запуск, если AirPods как раз переключаются в режим гарнитуры, — ждём до 10 с.
-    for _ in $(seq 1 40); do grep -qE "запись идёт|❌" "$LOG" && break; sleep 0.25; done
+    # CallTap сначала будит микрофон AirPods (до 4 с) и может повторить запуск — ждём до 20 с.
+    for _ in $(seq 1 80); do grep -qE "запись идёт|❌" "$LOG" && break; sleep 0.25; done
     if ! recording || ! grep -q "запись идёт" "$LOG"; then echo "❌ Запись не началась:"; cat "$LOG"; exit 1; fi
     echo "✅ Идёт запись: $name"
 }
