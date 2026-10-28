@@ -9,19 +9,64 @@ let script = home + "/.call-recorder/call-recorder.sh"
 let recDir = home + "/Movies/Записи звонков"
 let currentDir = home + "/.call-recorder/current"   // WAV текущей записи
 let logPath = home + "/.call-recorder/logs/calltap.log"
-let settingsPath = home + "/.call-recorder/settings"   // строки вида split=no; их же читает call-recorder.sh
+let settingsPath = home + "/.call-recorder/settings"   // строки вида split=no, live=yes, server=…; их же читает call-recorder.sh
+let tokenPath = home + "/.call-recorder/inbox-token"    // ключ сервера: только в этом файле (права 600), нигде не выводится
+let liveStatusPath = home + "/.call-recorder/logs/live-status"
+let uploadsDir = home + "/.call-recorder/uploads"
 
-/// Сохранять ли голоса отдельными файлами; выключается строкой split=no, по умолчанию включено.
-func splitEnabled() -> Bool {
+func setting(_ key: String) -> String? {
     let lines = ((try? String(contentsOfFile: settingsPath, encoding: .utf8)) ?? "").split(separator: "\n")
-    return lines.last { $0.hasPrefix("split=") } != "split=no"
+    return lines.last { $0.hasPrefix(key + "=") }.map { String($0.dropFirst(key.count + 1)) }
 }
 
-func setSplitEnabled(_ on: Bool) {
+func setSetting(_ key: String, _ value: String) {
     var lines = ((try? String(contentsOfFile: settingsPath, encoding: .utf8)) ?? "")
-        .split(separator: "\n").map(String.init).filter { !$0.hasPrefix("split=") }
-    lines.append("split=" + (on ? "yes" : "no"))
+        .split(separator: "\n").map(String.init).filter { !$0.hasPrefix(key + "=") }
+    lines.append(key + "=" + value)
     try? (lines.joined(separator: "\n") + "\n").write(toFile: settingsPath, atomically: true, encoding: .utf8)
+}
+
+/// Сохранять ли голоса отдельными файлами; выключается строкой split=no, по умолчанию включено.
+func splitEnabled() -> Bool { setting("split") != "no" }
+func setSplitEnabled(_ on: Bool) { setSetting("split", on ? "yes" : "no") }
+
+/// «Прямой эфир» — по умолчанию выключен.
+func liveEnabled() -> Bool { setting("live") == "yes" }
+func setLiveEnabled(_ on: Bool) { setSetting("live", on ? "yes" : "no") }
+
+func serverURL() -> String { setting("server") ?? "" }
+func hasToken() -> Bool { ((try? FileManager.default.attributesOfItem(atPath: tokenPath)[.size]) as? Int ?? 0) > 0 }
+func serverReady() -> Bool { !serverURL().isEmpty && hasToken() }
+
+func saveToken(_ token: String) {
+    FileManager.default.createFile(atPath: tokenPath, contents: Data((token + "\n").utf8), attributes: [.posixPermissions: 0o600])
+    try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tokenPath)
+}
+
+/// Состояние эфира для окна: LiveStream пишет в logs/live-status одно слово и обновляет файл после каждого
+/// отправленного куска; если файл не обновлялся 3 с — связи нет.
+func liveStateText(running: Bool) -> String {
+    guard serverReady() else { return "не задан сервер или ключ" }
+    guard running else { return "нет связи" }
+    let state = ((try? String(contentsOfFile: liveStatusPath, encoding: .utf8)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let modified = (try? FileManager.default.attributesOfItem(atPath: liveStatusPath)[.modificationDate]) as? Date ?? .distantPast
+    switch state {
+    case "wait": return "подключение…"
+    case "on": return Date().timeIntervalSince(modified) < 3 ? "в эфире" : "нет связи"
+    case "stopped": return "остановлен сервером"
+    default: return "нет связи"
+    }
+}
+
+/// Последняя отправка записи на сервер: (состояние uploading/ok/failed, имя записи), если была за последний час.
+func lastUpload() -> (state: String, name: String)? {
+    let urls = (try? FileManager.default.contentsOfDirectory(
+        at: URL(fileURLWithPath: uploadsDir), includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles])) ?? []
+    func modified(_ u: URL) -> Date { (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast }
+    guard let last = urls.max(by: { modified($0) < modified($1) }) else { return nil }
+    let state = ((try? String(contentsOf: last, encoding: .utf8)) ?? "").split(separator: "\n").first.map(String.init) ?? ""
+    if state == "failed" { return (state, last.lastPathComponent) }   // неотправленное показываем, пока не дошлём
+    return Date().timeIntervalSince(modified(last)) < 3600 ? (state, last.lastPathComponent) : nil
 }
 
 func runningProcessNames() -> Set<String> {
@@ -50,11 +95,12 @@ func newestFile(in dir: String, ext: String) -> URL? {
 
 func isDirectory(_ url: URL) -> Bool { (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false }
 
-/// Последняя запись: папка звонка или .m4a в корне (так сохранялись записи до разделения на три файла).
+/// Последняя запись: папка звонка или .m4a в корне. Имена: «ГГГГ-ММ-ДД_ЧЧ-ММ_Имя» (раньше — «Звонок …»).
 func latestRecording() -> URL? {
     let urls = (try? FileManager.default.contentsOfDirectory(
         at: URL(fileURLWithPath: recDir), includingPropertiesForKeys: [.creationDateKey, .isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
-    return urls.filter { $0.lastPathComponent.hasPrefix("Звонок") && (isDirectory($0) || $0.pathExtension == "m4a") }
+    let named = { (u: URL) in u.lastPathComponent.hasPrefix("Звонок") || u.lastPathComponent.range(of: #"^\d{4}-\d{2}-\d{2}"#, options: .regularExpression) != nil }
+    return urls.filter { named($0) && (isDirectory($0) || $0.pathExtension == "m4a") }
         .max { creationDate($0) < creationDate($1) }
 }
 
@@ -212,6 +258,7 @@ final class DetailsWindow: NSObject {
     private let levels = LevelsView(meterWidth: 200)
     private let warning = NSTextField(wrappingLabelWithString: "")
     private let splitBox = NSButton(checkboxWithTitle: "Сохранять голоса отдельно: «я» и «собеседник»", target: nil, action: nil)
+    private let liveBox = NSButton(checkboxWithTitle: "Прямой эфир: звук на сервер во время записи", target: nil, action: nil)
     private let recordButton = NSButton(title: "", target: nil, action: nil)
 
     var isVisible: Bool { panel.isVisible }
@@ -233,6 +280,9 @@ final class DetailsWindow: NSObject {
         splitBox.target = self
         splitBox.action = #selector(splitChanged)
         splitBox.toolTip = "Выключите, чтобы сохранять один файл с обоими голосами. Действует при сохранении записи."
+        liveBox.target = self
+        liveBox.action = #selector(liveChanged)
+        liveBox.toolTip = "Пока идёт запись, звук кусками уходит на сервер для подсказок по ходу разговора. Включается со следующей записи."
         recordButton.target = self
         recordButton.action = #selector(recordPressed)
         recordButton.bezelStyle = .rounded
@@ -243,7 +293,7 @@ final class DetailsWindow: NSObject {
         let separator = NSBox()
         separator.boxType = .separator
 
-        let stack = NSStackView(views: [status, levels, warning, separator, splitBox, NSStackView(views: [recordButton, folderButton])])
+        let stack = NSStackView(views: [status, levels, warning, separator, splitBox, liveBox, NSStackView(views: [recordButton, folderButton])])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 12
@@ -280,6 +330,7 @@ final class DetailsWindow: NSObject {
             fitToContent()
         }
         splitBox.state = splitEnabled() ? .on : .off
+        liveBox.state = liveEnabled() ? .on : .off
         let title = app.recording ? "Завершить запись" : "Начать запись"
         if recordButton.title != title {
             recordButton.title = title
@@ -295,6 +346,7 @@ final class DetailsWindow: NSObject {
     }
 
     @objc private func splitChanged() { setSplitEnabled(splitBox.state == .on) }
+    @objc private func liveChanged() { app.setLive(liveBox.state == .on) }
     @objc private func recordPressed() { app.toggle() }
 }
 
@@ -315,6 +367,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let reader = WavLevelReader()
     private let menuLevels = LevelsView(meterWidth: 150)
     private var statusMenuItem: NSMenuItem?
+    private(set) var liveRunning = false   // запущен ли LiveStream (обновляется раз в секунду в refresh)
     private var menuOpen = false
     private var levelTimer: Timer?
     private var lastLevelData = Date.distantPast
@@ -402,20 +455,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func statusText() -> String {
         if busy { return "Подождите…" }
-        return recording ? "● Идёт запись · " + elapsed() : "Запись не идёт"
+        guard recording else { return "Запись не идёт" }
+        return "● Идёт запись · " + elapsed() + (liveEnabled() ? " · эфир: " + liveStateText(running: liveRunning) : "")
     }
 
     @objc func toggle() {
         guard !busy else { return }
-        run(recording ? "off" : "on")
+        if recording { run(["off"]); return }
+        guard let client = askClientName() else { return }
+        run(["on", client])
     }
 
-    func run(_ arg: String) {
+    /// Имя клиента перед записью: попадёт в название папки «ГГГГ-ММ-ДД_ЧЧ-ММ_Имя» и в карточку на сервере.
+    func askClientName() -> String? {
+        let a = NSAlert()
+        a.messageText = "Имя клиента"
+        a.informativeText = "Как в карточке или в телефоне. Можно оставить пустым — клиента выберете потом на сервере."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        field.placeholderString = "Например: Эрик Эглиенс"
+        a.accessoryView = field
+        a.addButton(withTitle: "Начать запись")
+        a.addButton(withTitle: "Отмена")
+        a.window.initialFirstResponder = field
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return nil }
+        return field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func setLive(_ on: Bool) {
+        setLiveEnabled(on)
+        if on && !serverReady() { showServerSettings() }
+    }
+
+    /// Адрес сервера и ключ: ключ вводится в скрытое поле и сохраняется в файл с правами 600.
+    @objc func showServerSettings() {
+        let a = NSAlert()
+        a.messageText = "Сервер и ключ"
+        a.informativeText = "Куда отправлять записи и прямой эфир. Ключ — INBOX_TOKEN из настроек сервера."
+        let url = NSTextField(frame: NSRect(x: 0, y: 30, width: 320, height: 24))
+        url.placeholderString = "https://crm.example.com"
+        url.stringValue = serverURL()
+        let token = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        token.placeholderString = hasToken() ? "ключ сохранён — оставьте пустым, чтобы не менять" : "вставьте ключ"
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 54))
+        box.addSubview(url)
+        box.addSubview(token)
+        a.accessoryView = box
+        a.addButton(withTitle: "Сохранить")
+        a.addButton(withTitle: "Отмена")
+        a.window.initialFirstResponder = url
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        let address = url.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if address.hasPrefix("https://") || address.hasPrefix("http://") { setSetting("server", address) }
+        else if !address.isEmpty { alert("Адрес сервера должен начинаться с https://") }
+        let secret = token.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !secret.isEmpty { saveToken(secret) }
+    }
+
+    @objc func retryUpload() { run(["upload"]) }
+
+    func run(_ args: [String]) {
         busy = true
         refresh()
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/bash")
-        p.arguments = [script, arg]
+        p.arguments = [script] + args
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         p.environment = env
@@ -434,7 +539,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func refresh() {
-        let rec = runningProcessNames().contains("CallTap")
+        let names = runningProcessNames()
+        let rec = names.contains("CallTap")
+        liveRunning = names.contains("LiveStream")
         if rec && !recording { recordingStart = newestFile(in: currentDir, ext: "wav").map(creationDate) ?? Date() }
         if !rec { recordingStart = nil }
         recording = rec
@@ -479,6 +586,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 _ = add("Открыть настройки доступа к микрофону…", #selector(openMicSettings))
             }
         }
+        if !recording, let upload = lastUpload() {
+            switch upload.state {
+            case "uploading": _ = add("☁︎ Запись отправляется на сервер…", nil)
+            case "ok": _ = add("☁︎ Запись отправлена на сервер", nil)
+            default: _ = add("⚠︎ Запись не отправлена на сервер — повторить", #selector(retryUpload), enabled: !busy)
+            }
+        }
         menu.addItem(.separator())
         // Главное действие — со значком (● записать / ■ остановить) и полужирным, чтобы сразу бросалось в глаза.
         let action = add(recording ? "Завершить запись" : "Начать запись", #selector(toggle), enabled: !busy)
@@ -493,6 +607,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         let split = add("Сохранять голоса отдельно (я / собеседник)", #selector(toggleSplit))
         split.state = splitEnabled() ? .on : .off
+        let live = add("Прямой эфир (звук на сервер во время записи)", #selector(toggleLive))
+        live.state = liveEnabled() ? .on : .off
+        _ = add(serverReady() ? "Сервер и ключ…" : "Сервер и ключ… (не заданы)", #selector(showServerSettings))
         let login = add("Запускать при входе в систему", #selector(toggleLogin))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         _ = add("Убрать кнопку (запись не остановится)", #selector(quit))
@@ -504,6 +621,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func toggleSplit() { setSplitEnabled(!splitEnabled()) }
+
+    @objc func toggleLive() { setLive(!liveEnabled()) }
 
     @objc func openFolder() {
         try? FileManager.default.createDirectory(atPath: recDir, withIntermediateDirectories: true)
