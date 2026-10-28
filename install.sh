@@ -111,6 +111,14 @@ plist "$CALLTAP_APP" \
 echo "$calltap_hash" > "$DIR/.calltap-source.sha256"
 fi
 
+say "Собираю LiveStream (прямой эфир на сервер)"
+# Обычный исполняемый файл без разрешений macOS: читает файл записи и отправляет звук, поэтому пересборка ничего не сбрасывает.
+live_log=$(mktemp)
+if ! swiftc -O -swift-version 5 -target "$arch-apple-macos14.0" -o "$DIR/LiveStream" "$SRC/src/LiveStream/main.swift" 2>"$live_log"; then
+    cat "$live_log" >&2; die "Не удалось собрать LiveStream"
+fi
+rm -f "$live_log"
+
 say "Собираю кнопку «Запись звонков» для строки меню"
 pkill -f "Запись звонков.app/Contents/MacOS/CallRecorderMenu" 2>/dev/null || true
 build "$SRC/src/MenuBar/main.swift" "$MENU_APP" CallRecorderMenu 14.0
@@ -169,6 +177,7 @@ cat <<'DONE'
   • В строке меню справа (рядом с батареей) появился кружок ◯ — это кнопка записи.
     Клик по нему открывает меню: «Начать запись» / «Завершить запись», шкалы громкости,
     «Показать детали…», папка с записями, автозапуск при входе в систему.
-  • Из Терминала: call-recorder on | off | status
+  • Из Терминала: call-recorder on ["Имя клиента"] | off | status
   • Записи: ~/Movies/Записи звонков
+  • Отправка на свой сервер и «Прямой эфир» — меню «Сервер и ключ…» (по умолчанию выключено, см. README)
 DONE
