@@ -8,6 +8,14 @@ T=$(mktemp -d "${TMPDIR:-/tmp}/upload-test.XXXXXX")
 trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$T"' EXIT
 PORT=$((20000 + RANDOM % 20000))
 fail() { echo "❌ $*"; exit 1; }
+# События журнала ошибок через пробел (заодно проверка, что каждая строка — JSON и ключа сервера в журнале нет).
+events() { python3 -I - "$T/app/logs/errors.jsonl" <<'PY'
+import json, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+assert "test-token" not in text, "ключ сервера попал в журнал"
+print(" ".join(json.loads(l)["event"] for l in text.splitlines()))
+PY
+}
 
 mkdir -p "$T/app"
 cp "$ROOT/call-recorder.sh" "$T/app/call-recorder.sh"
@@ -51,5 +59,31 @@ bash "$T/app/call-recorder.sh" upload > "$T/up3.log" 2>&1 || fail "повтор 
 kill $srv
 [ -f "$T/srv3/inbox/$name/.ready" ] && [ "$(head -1 "$T/app/uploads/$name")" = "ok" ] || fail "повтор не дослал запись"
 echo "   при сбое — «не отправлено» без пометки готовности, «call-recorder upload» дослал ✓"
+python3 -I - "$T/app/logs/errors.jsonl" "$name" <<'PY' || exit 1
+import json, sys
+ev = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8")]
+fails = [e for e in ev if e["event"] == "upload_failed"]
+assert fails and all(e["details"]["http"] == "503" and e["session"] == sys.argv[2] for e in fails), fails
+assert "test-token" not in open(sys.argv[1], encoding="utf-8").read()
+PY
+echo "   журнал ошибок: неудачная отправка с кодом 503 и именем записи, ключа нет ✓"
+
+echo "▶︎ журнал ошибок после записи (в журнале CallTap нет строки «запись остановлена»)"
+: > "$T/app/logs/errors.jsonl"
+mkdir -p "$T/app/logs" "$T/app/current"
+touch "$T/app/logs/.recording-started"
+cat > "$T/app/logs/calltap.log" <<EOF
+21:14:16 ✅ запись идёт: собеседник (звук Mac) + микрофон «AirPods Pro (Roman)» → $T/app/current/$name.wav (rate=48000)
+21:14:19 уровень за 3 с: собеседник  -12.0 дБ, микрофон   -inf дБ
+21:14:29 уровень за 10 с: собеседник   -8.0 дБ, микрофон   -inf дБ
+21:14:31 ⚠️ звук не поступает 5 с — перезапускаю захват (микрофон «AirPods Pro (Roman)»)
+21:14:39 уровень за 10 с: собеседник   -9.0 дБ, микрофон   -inf дБ
+EOF
+bash "$T/app/call-recorder.sh" off > /dev/null 2>&1 || true
+bash "$T/app/call-recorder.sh" off > /dev/null 2>&1 || true   # второй раз — без повторов
+got=$(events)
+[ "$got" = "calltap_died calltap_message mic_silent" ] || fail "события после записи: «${got}»"
+bash "$T/app/call-recorder.sh" errors | grep -q "CallTap завершился сам" || fail "call-recorder errors не показывает событие"
+echo "   CallTap упал, перезапуск захвата, микрофон молчал — по одному разу; call-recorder errors читает журнал ✓"
 
 echo "✅ Отправка записей: все проверки пройдены"

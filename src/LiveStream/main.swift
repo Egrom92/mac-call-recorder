@@ -7,6 +7,7 @@
 // Остановка: SIGTERM — дочитать хвост файла, отправить последний кусок и выйти.
 import AVFoundation
 import Foundation
+import SystemConfiguration
 
 setvbuf(stdout, nil, _IOLBF, 0)
 
@@ -20,10 +21,64 @@ func log(_ s: String) { print("\(timeFormatter.string(from: Date())) \(s)") }
 let args = CommandLine.arguments
 guard args.count == 4 else { print("использование: LiveStream <файл.wav> <сессия> <адрес сервера>"); exit(2) }
 let wavPath = args[1], session = args[2], server = args[3].trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+
+// MARK: - Журнал ошибок
+
+let errorLogPath = appDir + "/logs/errors.jsonl"
+let isoTime: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.timeZone = .current; return f }()
+let computerName = (SCDynamicStoreCopyComputerName(nil, nil) as String?) ?? ProcessInfo.processInfo.hostName
+let appVersion = ((try? String(contentsOfFile: appDir + "/version", encoding: .utf8)) ?? "dev").trimmingCharacters(in: .whitespacesAndNewlines)
+
+/// Событие в общий журнал ошибок logs/errors.jsonl — строка JSON (формат — README, «Журнал ошибок»).
+/// Строка пишется одним write() в файл с O_APPEND, поэтому строки разных процессов не перемешиваются.
+func logEvent(_ level: String, _ event: String, _ message: String, details: [String: Any] = [:]) {
+    var e: [String: Any] = ["id": UUID().uuidString.lowercased(), "time": isoTime.string(from: Date()), "level": level,
+                            "source": "livestream", "event": event, "message": message, "session": session,
+                            "host": computerName, "version": appVersion]
+    if !details.isEmpty { e["details"] = details }
+    guard var line = try? JSONSerialization.data(withJSONObject: e, options: [.sortedKeys, .withoutEscapingSlashes]) else { return }
+    line.append(0x0A)
+    if let size = (try? FileManager.default.attributesOfItem(atPath: errorLogPath)[.size]) as? Int, size >= 2_000_000 {
+        try? FileManager.default.removeItem(atPath: errorLogPath + ".1")
+        try? FileManager.default.moveItem(atPath: errorLogPath, toPath: errorLogPath + ".1")
+    }
+    let fd = open(errorLogPath, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+    guard fd >= 0 else { return }
+    line.withUnsafeBytes { _ = write(fd, $0.baseAddress, $0.count) }
+    close(fd)
+}
+
+/// Сбои эфира без лавины: первый случай каждого вида пишется сразу, повторы того же вида — не чаще раза в минуту
+/// (с числом пропущенных). Все случаи считаются для итога в конце эфира.
+final class Problems {
+    private let lock = NSLock()
+    private var lastLogged: [String: Date] = [:]
+    private var skipped: [String: Int] = [:]
+    private var counts: [String: Int] = [:]
+    var total: [String: Int] { lock.lock(); defer { lock.unlock() }; return counts }
+
+    func report(_ level: String, _ event: String, kind: String, _ message: String, _ details: [String: Any]) {
+        lock.lock()
+        counts[kind, default: 0] += 1
+        if let t = lastLogged[kind], Date().timeIntervalSince(t) < 60 { skipped[kind, default: 0] += 1; lock.unlock(); return }
+        lastLogged[kind] = Date()
+        var d = details
+        if let n = skipped.removeValue(forKey: kind) { d["repeats_not_logged"] = n }
+        lock.unlock()
+        logEvent(level, event, message, details: d)
+    }
+}
+let problems = Problems()
+let startedAt = Date()
+
 let token: String = {
     let t = (try? String(contentsOfFile: appDir + "/inbox-token", encoding: .utf8))?
         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    if t.isEmpty { log("❌ нет ключа сервера (~/.call-recorder/inbox-token)"); exit(1) }
+    if t.isEmpty {
+        log("❌ нет ключа сервера (~/.call-recorder/inbox-token)")
+        logEvent("error", "live_no_token", "Прямой эфир не начался: нет ключа сервера")
+        exit(1)
+    }
     return t
 }()
 
@@ -38,11 +93,22 @@ let maxQueued = 20                 // ~10 с: при плохой сети ст�
 final class Status {
     private let lock = NSLock()
     private var last = ""
+    private var lostAt: Date?
     func set(_ state: String) {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
         // Повторяем запись и при том же состоянии: окно по времени изменения файла видит, что эфир жив.
         try? (state + "\n").write(toFile: statusPath, atomically: true, encoding: .utf8)
-        if state != last { log("эфир: \(state)"); last = state }
+        var restoredAfter: Int?
+        if state != last {
+            log("эфир: \(state)")
+            if state == "error" && last == "on" { lostAt = Date() }
+            if state == "on", let t = lostAt { restoredAfter = Int(Date().timeIntervalSince(t).rounded()); lostAt = nil }
+            last = state
+        }
+        lock.unlock()
+        if let s = restoredAfter {
+            problems.report("info", "live_reconnected", kind: "reconnected", "Связь с сервером восстановилась", ["offline_seconds": s])
+        }
     }
 }
 let status = Status()
@@ -57,6 +123,8 @@ final class TrackSender {
     private let cond = NSCondition()
     private var finishing = false
     private(set) var dropped = 0
+    private(set) var sent = 0
+    private(set) var lost = 0
     var stopAll: () -> Void = {}
     var stopped = false
 
@@ -95,30 +163,51 @@ final class TrackSender {
         req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         for attempt in 0...3 {
             if stopped { return }
-            let code = post(req, data)
+            let (code, body, error) = post(req, data)
+            let details: [String: Any] = ["track": track, "seq": seq, "http": code, "attempt": attempt + 1, "response": body]
             switch code {
-            case 200: status.set("on"); return
-            case 409: log("[\(track)] сервер: разговор уже закрыт (409) — эфир остановлен"); status.set("stopped"); stopAll(); return
-            case 403: log("[\(track)] сервер: нет доступа (403) — проверьте ключ"); status.set("error"); stopAll(); return
-            case 400, 404, 413: log("[\(track)] сервер отклонил кусок \(seq): \(code)"); return
+            case 200: sent += 1; status.set("on"); return
+            case 409:
+                log("[\(track)] сервер: разговор уже закрыт (409) — эфир остановлен"); status.set("stopped")
+                problems.report("warning", "live_closed", kind: "409", "Сервер закрыл разговор (409) — эфир остановлен", details)
+                stopAll(); return
+            case 403:
+                log("[\(track)] сервер: нет доступа (403) — проверьте ключ"); status.set("error")
+                problems.report("error", "live_forbidden", kind: "403", "Сервер не принял ключ (403) — эфир остановлен", details)
+                stopAll(); return
+            case 400, 404, 413:
+                log("[\(track)] сервер отклонил кусок \(seq): \(code)")
+                problems.report("warning", "live_rejected", kind: "\(code)", "Сервер отклонил кусок эфира (\(code))", details)
+                return
             default:
                 status.set("error")
+                if code == 0 {
+                    problems.report("warning", "live_network_error", kind: "net: " + (error ?? "?"),
+                                    "Нет связи с сервером: " + (error ?? "неизвестная ошибка"), details)
+                } else {
+                    problems.report("warning", "live_http_error", kind: "\(code)", "Сервер ответил ошибкой \(code)", details)
+                }
                 if attempt < 3 { Thread.sleep(forTimeInterval: 0.25 * Double(1 << attempt)) }
             }
         }
+        lost += 1
         log("[\(track)] кусок \(seq) не отправлен после 3 повторов")
+        problems.report("warning", "live_chunk_lost", kind: "lost", "Кусок эфира пропущен после 3 повторов",
+                        ["track": track, "seq": seq])
     }
 
-    /// Синхронный POST; возвращает HTTP-код или 0 при сетевой ошибке.
-    private func post(_ req: URLRequest, _ data: Data) -> Int {
+    /// Синхронный POST; возвращает HTTP-код (0 при сетевой ошибке), начало ответа сервера и текст сетевой ошибки.
+    private func post(_ req: URLRequest, _ data: Data) -> (Int, String, String?) {
         let done = DispatchSemaphore(value: 0)
-        var code = 0
-        URLSession.shared.uploadTask(with: req, from: data) { _, resp, _ in
-            code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        var result: (Int, String, String?) = (0, "", nil)
+        URLSession.shared.uploadTask(with: req, from: data) { body, resp, error in
+            let text = body.flatMap { String(data: $0.prefix(300), encoding: .utf8) } ?? ""
+            result = ((resp as? HTTPURLResponse)?.statusCode ?? 0, text,
+                      error.map { e in "\(e.localizedDescription) (\((e as NSError).code))" })
             done.signal()
         }.resume()
         done.wait()
-        return code
+        return result
     }
 }
 
@@ -190,7 +279,12 @@ func readWavInfo(_ h: FileHandle) -> WavInfo? {
         let len = u32(off + 4)
         if id == "fmt " { channels = u16(off + 10); rate = Double(u32(off + 12)); bits = u16(off + 22) }
         if id == "data" {
-            guard channels == 2, bits == 16, rate > 0 else { log("❌ неожиданный формат WAV: \(channels) кан., \(bits) бит"); return nil }
+            guard channels == 2, bits == 16, rate > 0 else {
+                log("❌ неожиданный формат WAV: \(channels) кан., \(bits) бит")
+                logEvent("error", "live_bad_wav", "Прямой эфир не начался: неожиданный формат записи",
+                         details: ["channels": channels, "bits": bits, "rate": rate])
+                return nil
+            }
             return WavInfo(dataStart: UInt64(off + 8), rate: rate, channels: channels)
         }
         off += 8 + len + (len & 1)
@@ -265,6 +359,12 @@ senders.forEach { $0.finish() }
 let deadline = Date().addingTimeInterval(5)
 while threads.contains(where: { !$0.isFinished }) && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
 if me.dropped + them.dropped > 0 { log("выброшено из-за отставания сети: me \(me.dropped), them \(them.dropped)") }
+// Итог по звонку: сколько кусков ушло, сколько потеряно и каких сбоев сколько было.
+let dropped = me.dropped + them.dropped, lostChunks = me.lost + them.lost, kinds = problems.total.filter { $0.key != "reconnected" }
+let clean = kinds.isEmpty && dropped == 0
+logEvent(clean ? "info" : "warning", "live_summary", clean ? "Прямой эфир прошёл без сбоев" : "Прямой эфир прошёл со сбоями",
+         details: ["seconds": Int(Date().timeIntervalSince(startedAt)), "sent_me": me.sent, "sent_them": them.sent,
+                   "lost": lostChunks, "dropped_queue": dropped, "problems": kinds])
 if !me.stopped { status.set("stopped") }
 log("эфир завершён")
 _ = sigs

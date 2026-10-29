@@ -3,6 +3,7 @@
 // Иконка показывает состояние: ◯ — запись не идёт, красный ● с таймером — идёт запись.
 import AppKit
 import ServiceManagement
+import SystemConfiguration
 
 let home = FileManager.default.homeDirectoryForCurrentUser.path
 let script = home + "/.call-recorder/call-recorder.sh"
@@ -13,6 +14,45 @@ let settingsPath = home + "/.call-recorder/settings"   // строки вида 
 let tokenPath = home + "/.call-recorder/inbox-token"    // ключ сервера: только в этом файле (права 600), нигде не выводится
 let liveStatusPath = home + "/.call-recorder/logs/live-status"
 let uploadsDir = home + "/.call-recorder/uploads"
+let errorLogPath = home + "/.call-recorder/logs/errors.jsonl"   // общий журнал ошибок (README, «Журнал ошибок»)
+
+let isoTime: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.timeZone = .current; return f }()
+
+/// Событие в общий журнал ошибок — строка JSON, одним write() в файл с O_APPEND (как у call-recorder.sh и LiveStream).
+func logEvent(_ level: String, _ event: String, _ message: String, session: String? = nil, details: [String: Any] = [:]) {
+    var e: [String: Any] = ["id": UUID().uuidString.lowercased(), "time": isoTime.string(from: Date()), "level": level,
+                            "source": "menu", "event": event, "message": message,
+                            "host": (SCDynamicStoreCopyComputerName(nil, nil) as String?) ?? ProcessInfo.processInfo.hostName,
+                            "version": ((try? String(contentsOfFile: home + "/.call-recorder/version", encoding: .utf8)) ?? "dev")
+                                .trimmingCharacters(in: .whitespacesAndNewlines)]
+    if let session, !session.isEmpty { e["session"] = session }
+    if !details.isEmpty { e["details"] = details }
+    guard var line = try? JSONSerialization.data(withJSONObject: e, options: [.sortedKeys, .withoutEscapingSlashes]) else { return }
+    line.append(0x0A)
+    if let size = (try? FileManager.default.attributesOfItem(atPath: errorLogPath)[.size]) as? Int, size >= 2_000_000 {
+        try? FileManager.default.removeItem(atPath: errorLogPath + ".1")
+        try? FileManager.default.moveItem(atPath: errorLogPath, toPath: errorLogPath + ".1")
+    }
+    let fd = open(errorLogPath, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+    guard fd >= 0 else { return }
+    line.withUnsafeBytes { _ = write(fd, $0.baseAddress, $0.count) }
+    close(fd)
+}
+
+/// CallTap пропал посреди записи? При обычной остановке он пишет в журнал «запись остановлена»; если запись
+/// успела начаться, а этой строки нет — он упал или его убили. Пишем в журнал ошибок сразу и оставляем метку,
+/// чтобы call-recorder.sh при сохранении не записал то же самое второй раз.
+func noteIfCaptureDied() {
+    let log = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
+    guard log.contains("запись идёт"), !log.contains("запись остановлена") else { return }
+    // Строка «✅ запись идёт: … → /…/<имя записи>.wav (rate=…)» → имя записи.
+    let startLine = log.split(separator: "\n").last { $0.contains("запись идёт") }.map(String.init) ?? ""
+    let wav = startLine.components(separatedBy: " → ").last?.components(separatedBy: ".wav (").first ?? ""
+    let session = (wav as NSString).lastPathComponent
+    logEvent("error", "calltap_died", "CallTap завершился сам посреди записи — запись оборвалась", session: session,
+             details: ["log": log.split(separator: "\n").suffix(5).joined(separator: "\n")])
+    FileManager.default.createFile(atPath: currentDir + "/.died-logged", contents: nil)
+}
 
 func setting(_ key: String) -> String? {
     let lines = ((try? String(contentsOfFile: settingsPath, encoding: .utf8)) ?? "").split(separator: "\n")
@@ -532,10 +572,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 self.busy = false
                 self.refresh()
-                if proc.terminationStatus != 0 { self.alert(out) }
+                if proc.terminationStatus != 0 {
+                    // Подробности пишет сам скрипт; здесь — то, что увидел пользователь.
+                    logEvent("error", "action_failed", "Команда «\(args.first ?? "")» завершилась с ошибкой — показано окно",
+                             details: ["exit": Int(proc.terminationStatus), "output": String(out.suffix(1500))])
+                    self.alert(out)
+                }
             }
         }
-        do { try p.run() } catch { busy = false; refresh(); alert("Не удалось запустить \(script): \(error.localizedDescription)") }
+        do { try p.run() } catch {
+            busy = false; refresh()
+            logEvent("error", "action_failed", "Не удалось запустить call-recorder.sh", details: ["error": error.localizedDescription])
+            alert("Не удалось запустить \(script): \(error.localizedDescription)")
+        }
     }
 
     func refresh() {
@@ -544,6 +593,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         liveRunning = names.contains("LiveStream")
         if rec && !recording { recordingStart = newestFile(in: currentDir, ext: "wav").map(creationDate) ?? Date() }
         if !rec { recordingStart = nil }
+        if recording && !rec { noteIfCaptureDied() }
         recording = rec
         guard let b = item.button else { return }
         if busy {
