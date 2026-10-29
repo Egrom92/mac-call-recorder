@@ -15,6 +15,8 @@ let tokenPath = home + "/.call-recorder/inbox-token"    // ключ сервер
 let liveStatusPath = home + "/.call-recorder/logs/live-status"
 let uploadsDir = home + "/.call-recorder/uploads"
 let errorLogPath = home + "/.call-recorder/logs/errors.jsonl"   // общий журнал ошибок (README, «Журнал ошибок»)
+let sentPosPath = home + "/.call-recorder/logs/send-logs.pos"         // докуда журнал отправлен на сервер (call-recorder.sh send-logs)
+let sendStatusPath = home + "/.call-recorder/logs/send-logs.status"   // итог последней отправки журнала: ok | retry | forbidden
 
 let isoTime: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.timeZone = .current; return f }()
 
@@ -39,16 +41,21 @@ func logEvent(_ level: String, _ event: String, _ message: String, session: Stri
     close(fd)
 }
 
+/// Имя текущей (или последней) записи — оно же session в журнале и папка на сервере — из строки CallTap
+/// «✅ запись идёт: … → /…/<имя записи>.wav (rate=…)».
+func recordingName(inLog log: String) -> String? {
+    guard let line = log.split(separator: "\n").last(where: { $0.contains("запись идёт") }) else { return nil }
+    let wav = String(line).components(separatedBy: " → ").last?.components(separatedBy: ".wav (").first ?? ""
+    return wav.isEmpty ? nil : (wav as NSString).lastPathComponent
+}
+
 /// CallTap пропал посреди записи? При обычной остановке он пишет в журнал «запись остановлена»; если запись
 /// успела начаться, а этой строки нет — он упал или его убили. Пишем в журнал ошибок сразу и оставляем метку,
 /// чтобы call-recorder.sh при сохранении не записал то же самое второй раз.
 func noteIfCaptureDied() {
     let log = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
     guard log.contains("запись идёт"), !log.contains("запись остановлена") else { return }
-    // Строка «✅ запись идёт: … → /…/<имя записи>.wav (rate=…)» → имя записи.
-    let startLine = log.split(separator: "\n").last { $0.contains("запись идёт") }.map(String.init) ?? ""
-    let wav = startLine.components(separatedBy: " → ").last?.components(separatedBy: ".wav (").first ?? ""
-    let session = (wav as NSString).lastPathComponent
+    let session = recordingName(inLog: log)
     logEvent("error", "calltap_died", "CallTap завершился сам посреди записи — запись оборвалась", session: session,
              details: ["log": log.split(separator: "\n").suffix(5).joined(separator: "\n")])
     FileManager.default.createFile(atPath: currentDir + "/.died-logged", contents: nil)
@@ -96,6 +103,38 @@ func liveStateText(running: Bool) -> String {
     case "stopped": return "остановлен сервером"
     default: return "нет связи"
     }
+}
+
+/// Есть ли в журнале ошибок строки, ещё не отправленные на сервер: call-recorder.sh send-logs помнит
+/// номер файла и позицию, докуда отправил.
+func journalUnsent() -> Bool {
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: errorLogPath),
+          let size = attrs[.size] as? Int, size > 0 else { return false }
+    let pos = ((try? String(contentsOfFile: sentPosPath, encoding: .utf8)) ?? "").split(whereSeparator: \.isWhitespace).compactMap { Int($0) }
+    return pos != [attrs[.systemFileNumber] as? Int ?? -1, size]
+}
+
+/// Журнал не уходит на сервер: отказ в ключе — сразу (keyProblem), нет связи — если не получается дольше 10 минут.
+func journalProblem() -> (text: String, keyProblem: Bool)? {
+    guard serverReady() else { return nil }
+    let lines = ((try? String(contentsOfFile: sendStatusPath, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+    switch lines.first {
+    case "forbidden": return ("⚠︎ Сервер не принял ключ — журнал ошибок не отправляется", true)
+    case "retry" where Date().timeIntervalSince1970 - (Double(lines.count > 1 ? lines[1] : "") ?? 0) >= 600:
+        return ("⚠︎ Журнал ошибок не отправлен — сервер недоступен, повтор раз в 5 минут", false)
+    default: return nil
+    }
+}
+
+/// call-recorder.sh с нужными аргументами; PATH — чтобы нашлись ffmpeg и прочее из Homebrew.
+func scriptProcess(_ args: [String]) -> Process {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/bash")
+    p.arguments = [script] + args
+    var env = ProcessInfo.processInfo.environment
+    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    p.environment = env
+    return p
 }
 
 /// Последняя отправка записи на сервер: (состояние uploading/ok/failed, имя записи), если была за последний час.
@@ -411,6 +450,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var menuOpen = false
     private var levelTimer: Timer?
     private var lastLevelData = Date.distantPast
+    private var logSender: Process?
+    private var lastLogCheck = Date.distantPast
 
     /// Шкалы для меню: своё view в пункте меню с отступами, как у обычных пунктов.
     private lazy var menuLevelsItem: NSMenuItem = {
@@ -551,6 +592,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         else if !address.isEmpty { alert("Адрес сервера должен начинаться с https://") }
         let secret = token.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if !secret.isEmpty { saveToken(secret) }
+        lastLogCheck = .distantPast   // журнал — сразу с новым ключом или адресом
+    }
+
+    /// Раз в 30 с: если в журнале ошибок есть новые строки — call-recorder.sh send-logs --auto в фоне.
+    /// Паузы после неудач (5 минут; после отказа в ключе — до смены ключа) выдерживает сам скрипт.
+    func sendLogsIfNeeded() {
+        guard Date().timeIntervalSince(lastLogCheck) >= 30 else { return }
+        lastLogCheck = Date()
+        guard serverReady(), logSender?.isRunning != true, journalUnsent() else { return }
+        let p = scriptProcess(["send-logs", "--auto"])
+        p.standardOutput = FileHandle.nullDevice   // скрипт сам пишет в logs/send-logs.log
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+        logSender = p
     }
 
     @objc func retryUpload() { run(["upload"]) }
@@ -558,12 +613,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func run(_ args: [String]) {
         busy = true
         refresh()
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/bash")
-        p.arguments = [script] + args
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        p.environment = env
+        let p = scriptProcess(args)
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = pipe
@@ -573,8 +623,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.busy = false
                 self.refresh()
                 if proc.terminationStatus != 0 {
-                    // Подробности пишет сам скрипт; здесь — то, что увидел пользователь.
+                    // Подробности пишет сам скрипт; здесь — то, что увидел пользователь. «off» относится к записи — с её именем.
+                    let log = args.first == "off" ? (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? "" : ""
                     logEvent("error", "action_failed", "Команда «\(args.first ?? "")» завершилась с ошибкой — показано окно",
+                             session: recordingName(inLog: log),
                              details: ["exit": Int(proc.terminationStatus), "output": String(out.suffix(1500))])
                     self.alert(out)
                 }
@@ -595,6 +647,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !rec { recordingStart = nil }
         if recording && !rec { noteIfCaptureDied() }
         recording = rec
+        sendLogsIfNeeded()
         guard let b = item.button else { return }
         if busy {
             b.image = symbol("hourglass")
@@ -642,6 +695,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             case "ok": _ = add("☁︎ Запись отправлена на сервер", nil)
             default: _ = add("⚠︎ Запись не отправлена на сервер — повторить", #selector(retryUpload), enabled: !busy)
             }
+        }
+        if let problem = journalProblem() {
+            _ = add(problem.text, problem.keyProblem ? #selector(showServerSettings) : nil)
         }
         menu.addItem(.separator())
         // Главное действие — со значком (● записать / ■ остановить) и полужирным, чтобы сразу бросалось в глаза.

@@ -11,11 +11,13 @@
 #   call-recorder token               — ввести ключ сервера (INBOX_TOKEN); хранится в ~/.call-recorder/inbox-token
 #   call-recorder upload              — повторить отправку записей, которые не ушли на сервер
 #   call-recorder errors [N]          — последние N событий журнала ошибок (по умолчанию 30)
+#   call-recorder send-logs           — отправить журнал ошибок на сервер сейчас (сам уходит после записи и раз в 30 с из меню)
 # Записи: ~/Movies/Записи звонков/«ГГГГ-ММ-ДД_ЧЧ-ММ_Имя клиента»/ — папка на каждый звонок с тремя файлами:
 #         «… — оба голоса.m4a», «… — я.m4a», «… — собеседник.m4a» (громкость выровнена).
 #         С split off — один файл «ГГГГ-ММ-ДД_ЧЧ-ММ_Имя клиента.m4a» с обоими голосами.
 # Сервер (если задан адрес и ключ): после записи файлы уходят в его inbox как me.m4a / them.m4a / mix.m4a с пометкой
 # готовности; с «Прямым эфиром» звук во время записи идёт кусками на /api/live/chunk (программа LiveStream).
+# Журнал ошибок уходит туда же на /api/logs.
 set -u
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 export LC_ALL="${LC_ALL:-en_US.UTF-8}"   # имена клиентов кириллицей: обрезка и замены по символам, а не байтам
@@ -29,6 +31,8 @@ SETTINGS="$DIR/settings"     # строки вида split=no, live=yes, server=
 TOKEN_FILE="$DIR/inbox-token"
 UPLOADS="$DIR/uploads"       # состояние отправки каждой записи: uploading / ok / failed и путь к ней
 ERRLOG="$DIR/logs/errors.jsonl"   # журнал ошибок всех частей программы: строка JSON на событие (README, «Журнал ошибок»)
+SENT_POS="$DIR/logs/send-logs.pos"         # докуда журнал отправлен на сервер: «номер файла (inode) позиция в байтах»
+SEND_STATUS="$DIR/logs/send-logs.status"   # итог последней отправки журнала: ok | retry | forbidden, с какого времени, причина
 REC_DIR="${CALL_RECORDER_REC_DIR:-$HOME/Movies/Записи звонков}"   # CALL_RECORDER_REC_DIR — только для тестов
 
 setting() { sed -n "s/^$1=//p" "$SETTINGS" 2>/dev/null | tail -1; }
@@ -162,7 +166,7 @@ start() {
     local w
     for w in "$CUR"/*.wav; do
         [ -f "$w" ] && log_event script warning leftover_recording \
-            "Несохранённая запись прошлого раза — сохранится вместе с новой" "file=$(basename "$w")"
+            "Несохранённая запись прошлого раза — сохранится вместе с новой" "session=$(basename "$w" .wav)" "file=$(basename "$w")"
     done
     : > "$LOG"
     touch "$DIR/logs/.recording-started"
@@ -356,6 +360,165 @@ upload_failed() {
     [ $any = 1 ] || echo "Неотправленных записей нет"
 }
 
+# --- Журнал ошибок → сервер (POST /api/logs, протокол docs/LOGS.md в CRM) ---------------------------------
+# Докуда журнал отправлен, помнит logs/send-logs.pos. По номеру файла видно, что журнал успел смениться
+# (errors.jsonl → errors.jsonl.1): тогда сначала досылается хвост прошлого, потом новый с начала.
+# Повтор пачки безопасен: сервер не пишет второй раз событие с уже известным id.
+
+send_status() {  # $1 — ok | retry | forbidden, $2 — причина. Время первой неудачи подряд сохраняется: по нему меню решает, пора ли тревожить.
+    local since; since=$(date +%s)
+    if [ "$1" != ok ] && [ "$(head -1 "$SEND_STATUS" 2>/dev/null)" = "$1" ]; then since=$(sed -n 2p "$SEND_STATUS"); fi
+    printf '%s\n%s\n%s\n' "$1" "$since" "${2:-}" > "$SEND_STATUS"
+}
+
+json_num() { plutil -extract "$1" raw -o - "$2" 2>/dev/null | grep -E '^[0-9]+$' || echo 0; }   # $1 — поле ответа, $2 — файл
+
+# Строки, которые сервер отверг (не примет никогда), — одним событием logs_rejected; оно уйдёт следующей пачкой.
+# Отказы по самим logs_rejected не записываем, чтобы не зациклиться.
+note_rejected() {  # $1 — пачка, $2 — ответ сервера
+    local n i k line ev id list="" count=0
+    n=$(json_num rejected "$2")
+    for ((i = 0; i < n; i++)); do
+        k=$(json_num "rejected.$i.line" "$2")
+        line=$(sed -n "${k}p" "$1")
+        ev=$(printf '%s' "$line" | sed -n 's/.*"event":"\([^"]*\)".*/\1/p')
+        id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+        [ "$ev" = logs_rejected ] && continue
+        count=$((count + 1))
+        # «calltap_died 2f1fa41f-…: time не ISO 8601»; у строки без кода события — её номер в пачке.
+        [ $count -le 10 ] && list+="${list:+$'\n'}${ev:-строка $k}${id:+ $id}: $(plutil -extract "rejected.$i.error" raw -o - "$2" 2>/dev/null)"
+    done
+    [ $count = 0 ] || log_event script warning logs_rejected "Сервер не принял события журнала: $count" "count=$count" "rejected=$list"
+}
+
+# Отправить новые строки журнала пачками до 500 строк и 1 МБ. Только целые строки: последнюю могут ещё дописывать.
+# Ответ 200 — пачка ушла; 413 — пачку пополам; 403 — ключ не подходит; сеть, 429, 5xx и прочее — повторить позже.
+send_logs() {  # $1 — --auto (кнопка в строке меню раз в 30 с): тихо, после неудачи не чаще раза в 5 минут, после 403 — только с новым ключом
+    local auto=0
+    if [ "${1:-}" = --auto ]; then auto=1; fi
+    if ! server_ready; then
+        [ $auto = 1 ] || echo "❌ Не заданы адрес сервера или ключ"
+        return $((1 - auto))
+    fi
+    mkdir -p "$DIR/logs"
+    if [ $auto = 1 ]; then
+        local state; state=$(head -1 "$SEND_STATUS" 2>/dev/null)
+        if [ "$state" = forbidden ] && ! [ "$TOKEN_FILE" -nt "$SEND_STATUS" ] && ! [ "$SETTINGS" -nt "$SEND_STATUS" ]; then return 0; fi
+        if [ "$state" = retry ] && [ $(($(date +%s) - $(stat -f%m "$SEND_STATUS"))) -lt 300 ]; then return 0; fi
+        exec >> "$DIR/logs/send-logs.log" 2>&1
+    fi
+    # Один отправитель за раз: из меню — сразу выходим (проверит снова через 30 с), после записи — ждём до минуты.
+    local lock="$DIR/logs/.send-logs.lock" tries=0 rc
+    until shlock -f "$lock" -p $$; do
+        tries=$((tries + 1))
+        if [ $auto = 1 ] || [ $tries -ge 60 ]; then return 0; fi
+        sleep 1
+    done
+    # Журнал отправки не растёт бесконечно: больше 1 МБ — остаются последние 2000 строк (на месте: файл открыт на дописывание).
+    if [ "$(stat -f%z "$DIR/logs/send-logs.log" 2>/dev/null || echo 0)" -gt 1000000 ]; then
+        local keep; keep=$(tail -n 2000 "$DIR/logs/send-logs.log"); printf '%s\n' "$keep" > "$DIR/logs/send-logs.log"
+    fi
+    send_logs_locked $auto; rc=$?
+    rm -f "$lock"
+    return $rc
+}
+
+send_logs_locked() {
+    local auto=$1 max=500 sent=0 dup=0 posted=0 rc=0 why="" round pos ino off file fino size lines n bytes code
+    local raw batch resp err stamp=""
+    raw=$(mktemp); batch=$(mktemp); resp=$(mktemp); err=$(mktemp)
+    for round in $(seq 1 200); do
+        pos=$(cat "$SENT_POS" 2>/dev/null); ino="${pos%% *}"; off="${pos##* }"
+        [[ "$off" =~ ^[0-9]+$ ]] || off=0
+        if [ -z "$pos" ] && [ -f "$ERRLOG.1" ]; then   # первая отправка — сначала прошлый журнал
+            printf '%s 0\n' "$(stat -f%i "$ERRLOG.1")" > "$SENT_POS"; continue
+        fi
+        if [ -f "$ERRLOG.1" ] && [ "$(stat -f%i "$ERRLOG.1")" = "$ino" ]; then file="$ERRLOG.1"
+        elif [ -f "$ERRLOG" ]; then
+            file="$ERRLOG"
+            [ "$(stat -f%i "$file")" = "$ino" ] || off=0   # журнал новый
+        else break
+        fi
+        fino=$(stat -f%i "$file"); size=$(stat -f%z "$file")
+        [ "$off" -le "$size" ] || off=0
+        if [ "$off" -ge "$size" ]; then
+            [ "$file" = "$ERRLOG.1" ] || break   # всё отправлено
+            printf '%s 0\n' "$(stat -f%i "$ERRLOG" 2>/dev/null || echo 0)" > "$SENT_POS"; continue   # дальше новый журнал
+        fi
+        tail -c "+$((off + 1))" "$file" | head -c 1000000 > "$raw"
+        [ "$(stat -f%i "$file" 2>/dev/null)" = "$fino" ] || continue   # журнал сменился, пока читали, — заново
+        lines=$(($(tr -cd '\n' < "$raw" | wc -c)))
+        if [ $lines = 0 ]; then
+            # Нет ни одной целой строки. В errors.jsonl последнюю ещё дописывают — подождём; в прошлом журнале
+            # или строка длиннее 1 МБ — это мусор, пропускаем, иначе встанет вся очередь.
+            if [ "$file" = "$ERRLOG.1" ] || [ $(($(wc -c < "$raw"))) -ge 1000000 ]; then
+                printf '%s %s\n' "$fino" $((off + $(wc -c < "$raw"))) > "$SENT_POS"; continue
+            fi
+            break
+        fi
+        n=$((lines < max ? lines : max))
+        head -n $n "$raw" > "$batch"
+        bytes=$(($(wc -c < "$batch")))
+        code=$(API_TIMEOUT=30 api /api/logs -H 'Content-Type: application/x-ndjson' -H 'Expect:' --data-binary "@$batch" \
+            --retry 2 -o "$resp" -w '%{http_code}' 2>"$err")
+        code="${code: -3}"   # с повторами curl печатает код каждой попытки подряд
+        # 200 без {"ok":true} — это не наш сервер (например, страница-заглушка): события не считаем отправленными.
+        if [ "$code" = 200 ] && [ "$(plutil -extract ok raw -o - "$resp" 2>/dev/null)" != true ]; then code=bad; fi
+        case "$code" in
+            200)
+                printf '%s %s\n' "$fino" $((off + bytes)) > "$SENT_POS"
+                posted=1
+                sent=$((sent + $(json_num accepted "$resp"))); dup=$((dup + $(json_num duplicates "$resp")))
+                note_rejected "$batch" "$resp" ;;
+            413)
+                if [ $n -gt 1 ]; then max=$((n / 2)); continue; fi
+                # Сервер не берёт даже одну эту строку — не возьмёт никогда.
+                printf '%s %s\n' "$fino" $((off + bytes)) > "$SENT_POS"
+                printf '{"rejected":[{"line":1,"error":"сервер ответил 413: строка слишком большая"}]}' > "$resp"
+                note_rejected "$batch" "$resp" ;;
+            403) why="сервер не принял ключ"; send_status forbidden "$why"; rc=1; break ;;
+            *)
+                if [ "${code:-000}" = 000 ]; then why="нет связи: $(tail -n 1 "$err" | sed 's/^curl: //')"
+                elif [ "$code" = bad ]; then why="непонятный ответ сервера: $(head -c 100 "$resp")"
+                else why="сервер ответил $code"; fi
+                send_status retry "$why"; rc=1; break ;;
+        esac
+    done
+    rm -f "$raw" "$batch" "$resp" "$err"
+    if [ $rc = 0 ] && [ $posted = 1 ]; then send_status ok; fi
+    [ -t 1 ] || stamp="$(date '+%F %T') "
+    if [ "$(head -1 "$SEND_STATUS" 2>/dev/null)" = forbidden ] && [ $rc != 0 ]; then
+        echo "${stamp}❌ Журнал ошибок не отправлен: сервер не принял ключ — проверьте его (call-recorder token)"
+    elif [ $rc != 0 ]; then
+        echo "${stamp}⚠️  Журнал ошибок не отправлен ($why) — повторю позже"
+    elif [ $posted = 1 ]; then
+        echo "${stamp}✅ Журнал ошибок отправлен на сервер: новых событий $sent$( [ $dup = 0 ] || echo ", уже были там $dup")"
+    elif [ $auto = 0 ]; then
+        echo "${stamp}Журнал ошибок: новых событий нет"
+    fi
+    return $rc
+}
+
+# После записи, остановки и отправки записи — журнал на сервер в фоне, не задерживая команду
+# (кнопка в строке меню вдобавок проверяет его раз в 30 с).
+send_logs_later() {
+    server_ready && ! journal_sent || return 0
+    nohup bash "$DIR/call-recorder.sh" send-logs >> "$DIR/logs/send-logs.log" 2>&1 &
+}
+
+# Журнал отправлен до конца: позиция отправки — конец errors.jsonl (или журнал пуст).
+journal_sent() { [ "$(cat "$SENT_POS" 2>/dev/null)" = "$(stat -f'%i %z' "$ERRLOG" 2>/dev/null)" ] || [ ! -s "$ERRLOG" ]; }
+
+# Состояние отправки журнала одной строкой — для call-recorder status.
+logs_state() {
+    server_ready || { echo "не отправляется — не заданы адрес сервера или ключ"; return; }
+    case "$(head -1 "$SEND_STATUS" 2>/dev/null)" in
+        forbidden) echo "не отправляется — сервер не принял ключ" ;;
+        retry) echo "не отправлен с $(date -r "$(sed -n 2p "$SEND_STATUS")" '+%d.%m %H:%M') ($(sed -n 3p "$SEND_STATUS")), повтор раз в 5 минут" ;;
+        *) if journal_sent; then echo "отправлен"; else echo "есть новые события — уйдут в течение минуты"; fi ;;
+    esac
+}
+
 status() {
     if recording; then
         echo "Идёт запись — $(grep "уровень" "$LOG" | tail -1)"
@@ -368,6 +531,7 @@ status() {
     local srv; srv=$(server_url)
     echo "Сервер: ${srv:-не задан}, $( [ -s "$TOKEN_FILE" ] && echo "ключ задан" || echo "ключ не задан")"
     if live_enabled; then echo "Прямой эфир: включён"; else echo "Прямой эфир: выключен"; fi
+    echo "Журнал ошибок на сервере: $(logs_state)"
 }
 
 set_onoff() {  # $1 — ключ настройки, $2 — on|off
@@ -397,8 +561,8 @@ set_server() {
 }
 
 case "${1:-}" in
-    on|start) start "${2:-}" ;;
-    off|stop) stop ;;
+    on|start) trap send_logs_later EXIT; start "${2:-}" ;;
+    off|stop) trap send_logs_later EXIT; stop ;;
     status) status ;;
     split)
         set_onoff split "${2:-}"
@@ -410,9 +574,10 @@ case "${1:-}" in
         else echo "✅ Прямой эфир выключен"; fi ;;
     server) set_server "${2:-}" ;;
     token) set_token ;;
-    upload) upload_failed ;;
-    upload-one) upload_one "${2:-}" "${3:-}" ;;
+    upload) trap send_logs_later EXIT; upload_failed ;;
+    upload-one) trap send_logs_later EXIT; upload_one "${2:-}" "${3:-}" ;;
     errors) show_errors "${2:-30}" ;;
+    send-logs) send_logs "${2:-}" ;;
     log-event) shift; log_event "$@" ;;   # для кнопки в строке меню и тестов
-    *) echo "использование: call-recorder on [\"Имя клиента\"] | off | status | split on|off | live on|off | server <адрес> | token | upload | errors [N]"; exit 2 ;;
+    *) echo "использование: call-recorder on [\"Имя клиента\"] | off | status | split on|off | live on|off | server <адрес> | token | upload | errors [N] | send-logs"; exit 2 ;;
 esac
