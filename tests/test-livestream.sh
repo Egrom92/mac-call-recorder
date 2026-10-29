@@ -4,12 +4,25 @@
 # 1) растущий WAV как у CallTap: 48 кГц стерео, канал 1 — тон 440 Гц («собеседник»), канал 2 — 1000 Гц («я»);
 #    проверяем порядок и размер кусков, повтор после 503, частоты и длительность полученного звука 16 кГц;
 # 2) сервер отвечает 409 — эфир должен остановиться.
+# В обоих случаях проверяем журнал ошибок logs/errors.jsonl: правильный JSON, нужные события, ключа сервера нет.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 T=$(mktemp -d "${TMPDIR:-/tmp}/livestream-test.XXXXXX")
 trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$T"' EXIT
 PORT=$((20000 + RANDOM % 20000))
 fail() { echo "❌ $*"; exit 1; }
+# Журнал ошибок: каждая строка — JSON с обязательными полями, ключа сервера нет; печатает события через пробел.
+journal() { python3 -I - "$1" <<'PY'
+import json, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+assert "test-token" not in text, "ключ сервера попал в журнал"
+events = [json.loads(l) for l in text.splitlines()]
+for e in events:
+    missing = {"id", "time", "level", "source", "event", "message", "host", "version"} - e.keys()
+    assert not missing, f"нет полей {missing}: {e}"
+print(" ".join(e["event"] for e in events))
+PY
+}
 
 echo "▶︎ сборка LiveStream"
 swiftc -O -swift-version 5 -target "$(uname -m)-apple-macos14.0" -o "$T/LiveStream" "$ROOT/src/LiveStream/main.swift" 2>/dev/null
@@ -74,6 +87,19 @@ print("   повтор после 503 ✓")
 PY
 grep -q "^stopped" "$T/app/logs/live-status" || fail "статус в конце не stopped"
 echo "   статус в конце: $(cat "$T/app/logs/live-status") ✓"
+events=$(journal "$T/app/logs/errors.jsonl") || fail "журнал ошибок испорчен"
+[[ " $events " == *" live_http_error "* && " $events " == *" live_summary "* ]] || fail "в журнале нет сбоя 503 или итога: $events"
+python3 -I - "$T/app/logs/errors.jsonl" <<'PY' || exit 1
+import json, sys
+ev = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8")]
+err = next(e for e in ev if e["event"] == "live_http_error")
+assert err["details"]["http"] == 503 and err["details"]["track"] == "me" and err["session"].endswith("Тест Тестов"), err
+s = next(e for e in ev if e["event"] == "live_summary")
+assert s["level"] == "warning" and s["details"]["sent_me"] == 12 and s["details"]["sent_them"] == 12, s
+assert s["details"]["problems"] == {"503": 1} and s["details"]["lost"] == 0, s
+PY
+echo "   журнал ошибок: сбой 503 с дорожкой и номером куска, итог эфира 12/12 ✓"
+mv "$T/app/logs/errors.jsonl" "$T/case1/errors.jsonl"
 
 echo "▶︎ случай 2: сервер закрыл разговор (409)"
 mkdir -p "$T/case2"; run_case "$T/case2" --close-after 3
@@ -81,5 +107,8 @@ grep -q "разговор уже закрыт (409)" "$T/case2/live.log" || fail
 after=$(awk '$4 >= 0 && $5 == "409"' "$T/case2/requests.log" | wc -l | tr -d ' ')
 [ "$after" -le 2 ] || fail "после 409 запросы продолжились ($after)"
 echo "   эфир остановлен после 409 ✓"
+events=$(journal "$T/app/logs/errors.jsonl") || fail "журнал ошибок испорчен"
+[[ " $events " == *" live_closed "* ]] || fail "в журнале нет остановки по 409: $events"
+echo "   журнал ошибок: остановка по 409 ✓"
 
 echo "✅ LiveStream: все проверки пройдены"

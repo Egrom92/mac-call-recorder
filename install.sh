@@ -133,6 +133,8 @@ plist "$MENU_APP" \
 
 say "Ставлю команду call-recorder"
 install -m 755 "$SRC/call-recorder.sh" "$DIR/call-recorder.sh"
+# Версия — в каждом событии журнала ошибок: коммит, если ставим из клона, иначе дата установки.
+git -C "$SRC" describe --always --dirty 2>/dev/null > "$DIR/version" || echo "main-$(date +%F)" > "$DIR/version"
 ln -sf "$DIR/call-recorder.sh" "$(brew --prefix)/bin/call-recorder"
 
 # --- 6. Проверка BlackHole и разрешений ----------------------------------------
