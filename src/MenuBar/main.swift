@@ -201,6 +201,26 @@ func symbol(_ name: String, red: Bool = false) -> NSImage? {
     return img
 }
 
+/// Меню «Правка». У кнопки в строке меню нет своей строки меню, а ⌘V, ⌘C, ⌘X, ⌘A и ⌘Z в полях ввода
+/// (имя клиента, «Сервер и ключ») macOS выполняет через пункты этого меню — без него в ответ только звук ошибки.
+/// Самого меню не видно, работают только сочетания клавиш.
+func installEditMenu() {
+    let edit = NSMenu(title: "Правка")
+    edit.addItem(withTitle: "Отменить", action: Selector(("undo:")), keyEquivalent: "z")
+    edit.addItem(withTitle: "Повторить", action: Selector(("redo:")), keyEquivalent: "z").keyEquivalentModifierMask = [.command, .shift]
+    edit.addItem(.separator())
+    edit.addItem(withTitle: "Вырезать", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+    edit.addItem(withTitle: "Скопировать", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+    edit.addItem(withTitle: "Вставить", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    edit.addItem(withTitle: "Выбрать все", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+    let editItem = NSMenuItem()
+    editItem.submenu = edit
+    let main = NSMenu()
+    main.addItem(NSMenuItem())   // первый пункт главного меню — меню приложения
+    main.addItem(editItem)
+    NSApp.mainMenu = main
+}
+
 // MARK: - Окно «Детали»
 
 /// Уровни текущей записи прямо из её WAV: CallTap дописывает файл порциями примерно каждые 0,2 с
@@ -471,6 +491,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        installEditMenu()
         // Новые значки встают левее всех и на MacBook прячутся под «чёлку»; ставим кнопку рядом с батареей
         // (позиция — расстояние от правого края в пунктах). Если пользователь перетащит её с ⌘, macOS запомнит новое место.
         let positionKey = "NSStatusItem Preferred Position CallRecorder"
