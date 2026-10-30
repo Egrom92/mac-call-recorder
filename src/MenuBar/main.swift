@@ -1,7 +1,10 @@
-// «Запись звонков» — кнопка в строке меню: клик открывает меню с «Начать запись» / «Завершить запись»
-// (~/.call-recorder/call-recorder.sh on/off) и, пока идёт запись, живыми шкалами уровней.
-// Иконка показывает состояние: ◯ — запись не идёт, красный ● с таймером — идёт запись.
+// «Запись звонков» — кнопка в строке меню: левый клик сразу начинает запись (~/.call-recorder/call-recorder.sh on)
+// и спрашивает имя клиента уже во время неё; правый клик и клик во время записи — меню с «Завершить запись»,
+// настройками и, пока идёт запись, живыми шкалами уровней. Звонок с iPhone закончился — запись останавливается сама.
+// Иконка показывает состояние: ◯ — запись не идёт, красный ◯ «Записать» — идёт звонок без записи,
+// красный ● с таймером — идёт запись.
 import AppKit
+import CoreAudio
 import ServiceManagement
 import SystemConfiguration
 
@@ -41,9 +44,13 @@ func logEvent(_ level: String, _ event: String, _ message: String, session: Stri
     close(fd)
 }
 
-/// Имя текущей (или последней) записи — оно же session в журнале и папка на сервере — из строки CallTap
+/// Имя текущей (или последней) записи — оно же session в журнале и папка на сервере: current/.session (его пишет
+/// call-recorder.sh при старте и после ввода имени клиента), у записей прошлых версий — из строки CallTap
 /// «✅ запись идёт: … → /…/<имя записи>.wav (rate=…)».
-func recordingName(inLog log: String) -> String? {
+func recordingName() -> String? {
+    let saved = ((try? String(contentsOfFile: currentDir + "/.session", encoding: .utf8)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    if !saved.isEmpty { return saved }
+    let log = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
     guard let line = log.split(separator: "\n").last(where: { $0.contains("запись идёт") }) else { return nil }
     let wav = String(line).components(separatedBy: " → ").last?.components(separatedBy: ".wav (").first ?? ""
     return wav.isEmpty ? nil : (wav as NSString).lastPathComponent
@@ -55,7 +62,7 @@ func recordingName(inLog log: String) -> String? {
 func noteIfCaptureDied() {
     let log = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
     guard log.contains("запись идёт"), !log.contains("запись остановлена") else { return }
-    let session = recordingName(inLog: log)
+    let session = recordingName()
     logEvent("error", "calltap_died", "CallTap завершился сам посреди записи — запись оборвалась", session: session,
              details: ["log": log.split(separator: "\n").suffix(5).joined(separator: "\n")])
     FileManager.default.createFile(atPath: currentDir + "/.died-logged", contents: nil)
@@ -80,6 +87,50 @@ func setSplitEnabled(_ on: Bool) { setSetting("split", on ? "yes" : "no") }
 /// «Прямой эфир» — по умолчанию выключен.
 func liveEnabled() -> Bool { setting("live") == "yes" }
 func setLiveEnabled(_ on: Bool) { setSetting("live", on ? "yes" : "no") }
+
+/// Останавливать запись, когда звонок закончился, — по умолчанию да (строка autostop=no выключает).
+func autoStopEnabled() -> Bool { setting("autostop") != "no" }
+func setAutoStopEnabled(_ on: Bool) { setSetting("autostop", on ? "yes" : "no") }
+
+/// Идёт ли звонок с iPhone (или FaceTime): такие звонки на Mac обслуживает служба avconferenced, и пока звонок
+/// идёт, она берёт звук с микрофона. Core Audio показывает это у каждого процесса (macOS 14+) — журналы читать не нужно.
+final class CallMonitor {
+    private var process = AudioObjectID(0)   // объект Core Audio службы avconferenced; ищется заново, если она перезапустилась
+
+    var callActive: Bool {
+        if string(process, kAudioProcessPropertyBundleID) != "com.apple.avconferenced" {
+            process = processes().first { string($0, kAudioProcessPropertyBundleID) == "com.apple.avconferenced" } ?? 0
+        }
+        guard process != 0 else { return false }
+        var a = address(kAudioProcessPropertyIsRunningInput)
+        var running: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        return AudioObjectGetPropertyData(process, &a, 0, nil, &size, &running) == noErr && running != 0
+    }
+
+    private func address(_ selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    }
+
+    private func processes() -> [AudioObjectID] {
+        let system = AudioObjectID(kAudioObjectSystemObject)
+        var a = address(kAudioHardwarePropertyProcessObjectList)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(system, &a, 0, nil, &size) == noErr, size > 0 else { return [] }
+        var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(system, &a, 0, nil, &size, &ids) == noErr else { return [] }
+        return Array(ids.prefix(Int(size) / MemoryLayout<AudioObjectID>.size))
+    }
+
+    private func string(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String {
+        guard object != 0 else { return "" }
+        var a = address(selector)
+        var value: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(object, &a, 0, nil, &size, &value) == noErr, let v = value else { return "" }
+        return v.takeRetainedValue() as String
+    }
+}
 
 func serverURL() -> String { setting("server") ?? "" }
 func hasToken() -> Bool { ((try? FileManager.default.attributesOfItem(atPath: tokenPath)[.size]) as? Int ?? 0) > 0 }
@@ -473,6 +524,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var logSender: Process?
     private var lastLogCheck = Date.distantPast
 
+    // Звонок с iPhone: идёт ли он сейчас, был ли во время записи и когда закончился (для остановки записи).
+    private let calls = CallMonitor()
+    private(set) var callActive = false
+    private var callSeenWhileRecording = false
+    private var callEndedAt: Date?
+    private var nameAlert: NSAlert?          // окно «Имя клиента», пока оно открыто
+    private var stopAfterNameAlert = false   // звонок закончился, пока окно было открыто
+
     /// Шкалы для меню: своё view в пункте меню с отступами, как у обычных пунктов.
     private lazy var menuLevelsItem: NSMenuItem = {
         let container = NSView()
@@ -502,7 +561,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.button?.imagePosition = .imageLeading
         menu.autoenablesItems = false
         menu.delegate = self
-        item.menu = menu
+        // Левый клик — сразу запись; правый клик (и любой клик во время записи) — меню. Меню привязывается
+        // к кнопке только на время показа, иначе macOS открывала бы его на любой клик.
+        item.button?.target = self
+        item.button?.action = #selector(statusClicked)
+        item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         refresh()
         // Пока меню открыто, главный цикл работает в режиме отслеживания событий, и обычные таймеры
         // не срабатывают; в режиме .common время на кнопке идёт и при открытом меню.
@@ -528,7 +591,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startLevelTicker()
     }
 
-    func menuDidClose(_ menu: NSMenu) { menuOpen = false }
+    func menuDidClose(_ menu: NSMenu) { menuOpen = false; item.menu = nil }
+
+    @objc func statusClicked() {
+        let event = NSApp.currentEvent
+        let menuWanted = event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true
+        if menuWanted || recording || busy { showMenu() } else { startRecording() }
+    }
+
+    func showMenu() {
+        item.menu = menu
+        item.button?.performClick(nil)
+    }
 
     func startLevelTicker() {
         guard levelTimer == nil else { return }
@@ -557,31 +631,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func statusText() -> String {
         if busy { return "Подождите…" }
-        guard recording else { return "Запись не идёт" }
+        guard recording else { return callActive ? "Идёт звонок — запись не идёт" : "Запись не идёт" }
         return "● Идёт запись · " + elapsed() + (liveEnabled() ? " · эфир: " + liveStateText(running: liveRunning) : "")
     }
 
     @objc func toggle() {
         guard !busy else { return }
-        if recording { run(["off"]); return }
-        guard let client = askClientName() else { return }
-        run(["on", client])
+        if recording { run(["off"]) } else { startRecording() }
     }
 
-    /// Имя клиента перед записью: попадёт в название папки «ГГГГ-ММ-ДД_ЧЧ-ММ_Имя» и в карточку на сервере.
-    func askClientName() -> String? {
+    /// Запись — сразу (call-recorder.sh on --name-later), имя клиента — уже во время неё.
+    func startRecording() {
+        guard !busy, !recording else { return }
+        run(["on", "--name-later"]) { [weak self] ok in if ok { self?.askClientName() } }
+    }
+
+    /// Имя клиента, пока запись уже идёт: попадёт в название папки «ГГГГ-ММ-ДД_ЧЧ-ММ_Имя» и в карточку на сервере
+    /// (call-recorder.sh name переименует запись и включит «Прямой эфир»). Если звонок закончится, пока окно открыто,
+    /// оно закроется само, набранное имя всё равно достанется записи, и запись сохранится.
+    func askClientName() {
         let a = NSAlert()
-        a.messageText = "Имя клиента"
+        a.messageText = "Запись идёт. Имя клиента?"
         a.informativeText = "Как в карточке или в телефоне. Можно оставить пустым — клиента выберете потом на сервере."
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
         field.placeholderString = "Например: Эрик Эглиенс"
         a.accessoryView = field
-        a.addButton(withTitle: "Начать запись")
-        a.addButton(withTitle: "Отмена")
+        a.addButton(withTitle: "Готово")
+        a.addButton(withTitle: "Без имени")
         a.window.initialFirstResponder = field
+        nameAlert = a
         NSApp.activate(ignoringOtherApps: true)
-        guard a.runModal() == .alertFirstButtonReturn else { return nil }
-        return field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let response = a.runModal()
+        nameAlert = nil
+        let name = response == .alertSecondButtonReturn ? "" : field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if stopAfterNameAlert {
+            stopAfterNameAlert = false
+            run(["name", name, "--no-live"]) { [weak self] _ in self?.autoStop() }
+        } else {
+            run(["name", name] + (recording ? [] : ["--no-live"]))   // CallTap успел завершиться — имя всё равно файлу
+        }
+    }
+
+    /// Звонок закончился — сохранить запись, как по «Завершить запись».
+    func autoStop() {
+        callSeenWhileRecording = false
+        callEndedAt = nil
+        guard recording else { return }
+        logEvent("info", "auto_stop", "Звонок закончился — запись остановлена сама", session: recordingName())
+        run(["off"])
     }
 
     func setLive(_ on: Bool) {
@@ -631,7 +728,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func retryUpload() { run(["upload"]) }
 
-    func run(_ args: [String]) {
+    func run(_ args: [String], then: ((Bool) -> Void)? = nil) {
         busy = true
         refresh()
         let p = scriptProcess(args)
@@ -644,13 +741,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.busy = false
                 self.refresh()
                 if proc.terminationStatus != 0 {
-                    // Подробности пишет сам скрипт; здесь — то, что увидел пользователь. «off» относится к записи — с её именем.
-                    let log = args.first == "off" ? (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? "" : ""
+                    // Подробности пишет сам скрипт; здесь — то, что увидел пользователь. «off» и «name» — с именем записи.
                     logEvent("error", "action_failed", "Команда «\(args.first ?? "")» завершилась с ошибкой — показано окно",
-                             session: recordingName(inLog: log),
+                             session: ["off", "name"].contains(args.first ?? "") ? recordingName() : nil,
                              details: ["exit": Int(proc.terminationStatus), "output": String(out.suffix(1500))])
                     self.alert(out)
                 }
+                then?(proc.terminationStatus == 0)
             }
         }
         do { try p.run() } catch {
@@ -669,6 +766,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if recording && !rec { noteIfCaptureDied() }
         recording = rec
         sendLogsIfNeeded()
+        watchCall()
         guard let b = item.button else { return }
         if busy {
             b.image = symbol("hourglass")
@@ -680,11 +778,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             b.title = " " + elapsed() + (silent ? " ⚠︎" : "")
             b.toolTip = silent ? "Идёт запись, но микрофон молчит — разрешите CallTap доступ к микрофону (клик → меню)"
                                : "Идёт запись звонка. Клик — меню, там «Завершить запись»"
+        } else if callActive {
+            b.image = symbol("record.circle", red: true)
+            b.title = " Записать"
+            b.toolTip = "Идёт звонок. Клик — начать запись, правый клик — меню"
         } else {
             b.image = symbol("record.circle")
             b.title = ""
-            b.toolTip = "Запись звонков. Клик — меню, там «Начать запись»"
+            b.toolTip = "Запись звонков. Клик — начать запись, правый клик — меню"
         }
+    }
+
+    /// Раз в секунду: идёт ли звонок. Если звонок, который шёл во время записи, закончился и 2 с не возобновился
+    /// (короткие перерывы звука не в счёт), запись останавливается сама; окно имени, если открыто, закрывается.
+    private func watchCall() {
+        callActive = calls.callActive
+        if !recording {
+            callSeenWhileRecording = false
+            callEndedAt = nil
+            if nameAlert != nil { NSApp.abortModal() }   // CallTap завершился, пока спрашивали имя
+            return
+        }
+        if callActive { callSeenWhileRecording = true; callEndedAt = nil; return }
+        guard callSeenWhileRecording, autoStopEnabled(), !busy else { return }
+        let ended = callEndedAt ?? Date()
+        callEndedAt = ended
+        guard Date().timeIntervalSince(ended) >= 2 else { return }
+        if nameAlert != nil { stopAfterNameAlert = true; NSApp.abortModal() } else { autoStop() }
     }
 
     func elapsed() -> String {
@@ -736,6 +856,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         split.state = splitEnabled() ? .on : .off
         let live = add("Прямой эфир (звук на сервер во время записи)", #selector(toggleLive))
         live.state = liveEnabled() ? .on : .off
+        let autoStop = add("Останавливать запись, когда звонок закончился", #selector(toggleAutoStop))
+        autoStop.state = autoStopEnabled() ? .on : .off
         _ = add(serverReady() ? "Сервер и ключ…" : "Сервер и ключ… (не заданы)", #selector(showServerSettings))
         let login = add("Запускать при входе в систему", #selector(toggleLogin))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -750,6 +872,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleSplit() { setSplitEnabled(!splitEnabled()) }
 
     @objc func toggleLive() { setLive(!liveEnabled()) }
+
+    @objc func toggleAutoStop() { setAutoStopEnabled(!autoStopEnabled()) }
 
     @objc func openFolder() {
         try? FileManager.default.createDirectory(atPath: recDir, withIntermediateDirectories: true)
