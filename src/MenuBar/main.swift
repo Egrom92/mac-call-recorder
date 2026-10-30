@@ -95,17 +95,31 @@ func setAutoStopEnabled(_ on: Bool) { setSetting("autostop", on ? "yes" : "no") 
 /// Идёт ли звонок с iPhone (или FaceTime): такие звонки на Mac обслуживает служба avconferenced, и пока звонок
 /// идёт, она берёт звук с микрофона. Core Audio показывает это у каждого процесса (macOS 14+) — журналы читать не нужно.
 final class CallMonitor {
-    private var process = AudioObjectID(0)   // объект Core Audio службы avconferenced; ищется заново, если она перезапустилась
+    private var process = AudioObjectID(0)   // объект Core Audio службы avconferenced
+    private var lastScan = Date.distantPast
 
+    /// Раз в секунду — один запрос к Core Audio. Объект службы ищется заново, если его нет (не чаще раза в 5 с),
+    /// если он перестал отвечать (служба перезапустилась) и на всякий случай раз в минуту.
     var callActive: Bool {
-        if string(process, kAudioProcessPropertyBundleID) != "com.apple.avconferenced" {
-            process = processes().first { string($0, kAudioProcessPropertyBundleID) == "com.apple.avconferenced" } ?? 0
-        }
+        let sinceScan = Date().timeIntervalSince(lastScan)
+        if (process == 0 && sinceScan >= 5) || sinceScan >= 60 { scan() }
         guard process != 0 else { return false }
+        if let running = runningInput() { return running }
+        scan()
+        return runningInput() ?? false
+    }
+
+    private func scan() {
+        lastScan = Date()
+        process = processes().first { string($0, kAudioProcessPropertyBundleID) == "com.apple.avconferenced" } ?? 0
+    }
+
+    private func runningInput() -> Bool? {
+        guard process != 0 else { return nil }
         var a = address(kAudioProcessPropertyIsRunningInput)
         var running: UInt32 = 0
         var size = UInt32(MemoryLayout<UInt32>.size)
-        return AudioObjectGetPropertyData(process, &a, 0, nil, &size, &running) == noErr && running != 0
+        return AudioObjectGetPropertyData(process, &a, 0, nil, &size, &running) == noErr ? running != 0 : nil
     }
 
     private func address(_ selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
@@ -199,18 +213,18 @@ func lastUpload() -> (state: String, name: String)? {
     return Date().timeIntervalSince(modified(last)) < 3600 ? (state, last.lastPathComponent) : nil
 }
 
+/// Короткие имена (до 16 знаков) всех процессов — одним системным вызовом. Раз в секунду это в 14 раз дешевле,
+/// чем спрашивать путь к файлу каждого из ~800 процессов.
 func runningProcessNames() -> Set<String> {
-    let n = proc_listallpids(nil, 0)
-    var pids = [pid_t](repeating: 0, count: Int(n) + 64)
-    let count = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size))
-    var names = Set<String>()
-    var buf = [CChar](repeating: 0, count: 4096)
-    for pid in pids.prefix(Int(max(count, 0))) where pid > 0 {
-        if proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 {
-            names.insert((String(cString: buf) as NSString).lastPathComponent)
-        }
-    }
-    return names
+    var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL]
+    var size = 0
+    guard sysctl(&mib, 3, nil, &size, nil, 0) == 0 else { return [] }
+    var procs = [kinfo_proc](repeating: kinfo_proc(), count: size / MemoryLayout<kinfo_proc>.stride + 16)
+    size = procs.count * MemoryLayout<kinfo_proc>.stride
+    guard sysctl(&mib, 3, &procs, &size, nil, 0) == 0 else { return [] }
+    return Set(procs.prefix(size / MemoryLayout<kinfo_proc>.stride).map { p in
+        withUnsafeBytes(of: p.kp_proc.p_comm) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+    })
 }
 
 func creationDate(_ url: URL) -> Date {
@@ -530,6 +544,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var callSeenWhileRecording = false
     private var callEndedAt: Date?
     private var nameAlert: NSAlert?          // окно «Имя клиента», пока оно открыто
+    private var shownButton = ""              // что сейчас на кнопке в строке меню (showButton)
     private var stopAfterNameAlert = false   // звонок закончился, пока окно было открыто
 
     /// Шкалы для меню: своё view в пункте меню с отступами, как у обычных пунктов.
@@ -767,26 +782,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recording = rec
         sendLogsIfNeeded()
         watchCall()
-        guard let b = item.button else { return }
         if busy {
-            b.image = symbol("hourglass")
-            b.title = ""
-            b.toolTip = "Запись звонков: подождите…"
+            showButton("hourglass", title: "", toolTip: "Запись звонков: подождите…")
         } else if recording {
             let silent = micSilent()
-            b.image = symbol("record.circle.fill", red: true)
-            b.title = " " + elapsed() + (silent ? " ⚠︎" : "")
-            b.toolTip = silent ? "Идёт запись, но микрофон молчит — разрешите CallTap доступ к микрофону (клик → меню)"
-                               : "Идёт запись звонка. Клик — меню, там «Завершить запись»"
+            showButton("record.circle.fill", red: true, title: " " + elapsed() + (silent ? " ⚠︎" : ""),
+                       toolTip: silent ? "Идёт запись, но микрофон молчит — разрешите CallTap доступ к микрофону (клик → меню)"
+                                       : "Идёт запись звонка. Клик — меню, там «Завершить запись»")
         } else if callActive {
-            b.image = symbol("record.circle", red: true)
-            b.title = " Записать"
-            b.toolTip = "Идёт звонок. Клик — начать запись, правый клик — меню"
+            showButton("record.circle", red: true, title: " Записать", toolTip: "Идёт звонок. Клик — начать запись, правый клик — меню")
         } else {
-            b.image = symbol("record.circle")
-            b.title = ""
-            b.toolTip = "Запись звонков. Клик — начать запись, правый клик — меню"
+            showButton("record.circle", title: "", toolTip: "Запись звонков. Клик — начать запись, правый клик — меню")
         }
+    }
+
+    /// Значок и надпись на кнопке. Перерисовываем, только если что-то изменилось: иначе строка меню
+    /// перерисовывалась бы каждую секунду впустую.
+    private func showButton(_ name: String, red: Bool = false, title: String, toolTip: String) {
+        let state = "\(name)|\(red)|\(title)|\(toolTip)"
+        guard state != shownButton, let b = item.button else { return }
+        shownButton = state
+        b.image = symbol(name, red: red)
+        b.title = title
+        b.toolTip = toolTip
     }
 
     /// Раз в секунду: идёт ли звонок. Если звонок, который шёл во время записи, закончился и 2 с не возобновился
