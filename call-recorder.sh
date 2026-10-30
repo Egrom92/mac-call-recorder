@@ -3,6 +3,8 @@
 # CallTap пишет собеседника через Core Audio Process Tap (весь звук приложений Mac) и ваш голос с микрофона —
 # AirPods, если они подключены, иначе микрофон по умолчанию. Маршрут звонка не меняется.
 #   call-recorder on ["Имя клиента"]  — начать запись (имя попадёт в название папки)
+#   call-recorder on --name-later     — начать запись сразу, имя клиента — потом командой name (так делает кнопка в меню)
+#   call-recorder name ["Имя клиента"] — имя для идущей записи, начатой без него; включает «Прямой эфир»
 #   call-recorder off                 — остановить и сохранить (и отправить на сервер, если он настроен)
 #   call-recorder status              — идёт ли запись, эфир, сервер
 #   call-recorder split on|off        — сохранять ли голоса отдельными файлами (по умолчанию да)
@@ -84,14 +86,17 @@ log_event() {
         "$level" "$source" "$event" "$(json_str "$message")" "$extra" >> "$ERRLOG"
 }
 
-# Микрофон и имя записи — из строки CallTap «✅ запись идёт: … микрофон «…» → …/<имя>.wav (…)».
+# Микрофон — из строки CallTap «✅ запись идёт: … микрофон «…» → …/<имя>.wav (…)». Имя записи — из current/.session
+# (его пишут start и name: после ввода имени клиента файл переименован), у записей прошлых версий — из той же строки.
 mic_name() { sed -n 's/.*микрофон «\(.*\)» → .*/\1/p' "$LOG" 2>/dev/null | tail -1; }
-log_session() { sed -n 's|.*запись идёт: .* → .*/\(.*\)\.wav (.*|\1|p' "$LOG" 2>/dev/null | tail -1; }
+log_session() { cat "$CUR/.session" 2>/dev/null || sed -n 's|.*запись идёт: .* → .*/\(.*\)\.wav (.*|\1|p' "$LOG" 2>/dev/null | tail -1; }
 
 # После записи — всё тревожное из журнала CallTap в журнал ошибок. Сам CallTap не трогаем: его пересборка
 # сбросила бы разрешения macOS. Каждую запись разбираем один раз (имя последней разобранной — в logs/.checked).
 check_capture() {
     local session; session=$(log_session)
+    # Разбираем только начавшуюся запись (при неудачном старте разбирать нечего — об этом уже есть start_failed).
+    grep -q "запись идёт" "$LOG" 2>/dev/null || return 0
     [ -n "$session" ] && [ "$(cat "$DIR/logs/.checked" 2>/dev/null)" != "$session" ] || return 0
     printf '%s\n' "$session" > "$DIR/logs/.checked"
     # При обычной остановке CallTap пишет «запись остановлена»; если нет — он упал или его убили посреди записи.
@@ -142,13 +147,22 @@ raw.split("\n").filter(Boolean).map(l => {
 
 # Имя записи — оно же имя папки и сессии эфира на сервере: ГГГГ-ММ-ДД_ЧЧ-ММ_Имя клиента
 # (без имени — только дата и время). Без «/» и «\», не начинается с точки, не длиннее 120 символов.
-session_name() {
+session_name() {  # $1 — имя клиента, $2 — дата и время начала (по умолчанию сейчас)
     local client="${1:-}"
     client="${client//\//-}"; client="${client//\\/-}"
     client=$(printf '%s' "$client" | sed -E 's/^[[:space:].]+//; s/[[:space:]]+$//')
     client="${client:0:100}"
-    local stamp; stamp=$(date '+%Y-%m-%d_%H-%M')
+    local stamp="${2:-$(date '+%Y-%m-%d_%H-%M')}"
     if [ -n "$client" ]; then printf '%s_%s' "$stamp" "$client"; else printf '%s' "$stamp"; fi
+}
+
+# Два звонка за одну минуту с тем же именем не должны затирать друг друга (и на сервере это разные разговоры).
+unique_name() {
+    local name="$1" n=2
+    while [ -e "$REC_DIR/$name" ] || [ -e "$REC_DIR/$name.m4a" ] || [ -e "$CUR/$name.wav" ]; do
+        name="${1}_${n}"; n=$((n + 1))
+    done
+    printf '%s' "$name"
 }
 
 # POST на сервер с ключом. Ключ идёт заголовком через отдельный поток: его не видно ни в списке процессов, ни в журналах.
@@ -158,7 +172,9 @@ api() {  # $1 — путь (/api/…), дальше — аргументы curl
         -H @<(printf 'Authorization: Bearer %s\n' "$(tr -d '[:space:]' < "$TOKEN_FILE")") "$@" "$(server_url)$path"
 }
 
-start() {
+start() {  # $1 — имя клиента или --name-later: запись сразу, имя потом командой name (эфир включится после него)
+    local later=0 client="${1:-}"
+    if [ "$client" = --name-later ]; then later=1; client=""; fi
     if recording; then echo "Запись уже идёт"; return 0; fi
     [ -x "$BIN" ] || { echo "❌ CallTap не установлен — запустите install.sh"; log_event script error calltap_missing "CallTap не установлен"; exit 1; }
     mkdir -p "$CUR" "$REC_DIR" "$DIR/logs"
@@ -170,12 +186,10 @@ start() {
     done
     : > "$LOG"
     touch "$DIR/logs/.recording-started"
-    local name; name=$(session_name "${1:-}")
-    # Два звонка за одну минуту с тем же именем не должны затирать друг друга (и на сервере это разные разговоры).
-    local first="$name" n=2
-    while [ -e "$REC_DIR/$name" ] || [ -e "$REC_DIR/$name.m4a" ] || [ -e "$CUR/$name.wav" ]; do
-        name="${first}_${n}"; n=$((n + 1))
-    done
+    local stamp name; stamp=$(date '+%Y-%m-%d_%H-%M')
+    name=$(unique_name "$(session_name "$client" "$stamp")")
+    printf '%s\n' "$name" > "$CUR/.session"
+    if [ $later = 1 ]; then printf '%s\n' "$stamp" > "$CUR/.name-pending"; else rm -f "$CUR/.name-pending"; fi
     open -n -g "$APP" --stdout "$LOG" --stderr "$LOG" --args record "$CUR/$name.wav"
     # CallTap может повторить запуск, если AirPods как раз переключаются в режим гарнитуры, — ждём до 10 с.
     for _ in $(seq 1 40); do grep -qE "запись идёт|❌" "$LOG" && break; sleep 0.25; done
@@ -186,8 +200,33 @@ start() {
     fi
     echo "✅ Идёт запись: $name"
     log_event script info recording_started "Запись началась" "session=$name" "mic=$(mic_name)" \
-        "live=$(live_enabled && echo yes || echo no)"
-    if live_enabled; then start_live "$name"; fi
+        "live=$(live_enabled && echo yes || echo no)" "name_later=$( [ $later = 1 ] && echo yes || echo no)"
+    if [ $later = 1 ]; then echo "   имя клиента — командой call-recorder name «Имя»$(live_enabled && echo "; прямой эфир включится после неё")"
+    elif live_enabled; then start_live "$name"; fi
+}
+
+# Имя клиента для записи, начатой с --name-later (кнопка в строке меню спрашивает его уже во время записи).
+# Файл записи переименовывается: CallTap пишет в открытый файл, новое имя ему не мешает. Потом включается «Прямой эфир» —
+# уже с этим именем, потому что сервер связывает эфир с записью по имени папки; эфир прочитает запись с самого начала.
+# Пустое имя — запись остаётся с датой и временем. --no-live — без эфира (звонок уже кончился).
+name_recording() {  # $1 — имя клиента, $2 — --no-live
+    local stamp old new
+    stamp=$(cat "$CUR/.name-pending" 2>/dev/null); old=$(cat "$CUR/.session" 2>/dev/null)
+    if [ -z "$stamp" ] || [ ! -f "$CUR/$old.wav" ]; then echo "❌ Нет записи, которая ждёт имени клиента"; exit 1; fi
+    new="$old"
+    if [ -n "$(printf '%s' "${1:-}" | tr -d '[:space:]')" ]; then
+        new=$(unique_name "$(session_name "$1" "$stamp")")
+        if ! mv "$CUR/$old.wav" "$CUR/$new.wav"; then
+            echo "❌ Не удалось переименовать запись"
+            log_event script error rename_failed "Не удалось дать записи имя клиента" "session=$old" "to=$new"
+            exit 1
+        fi
+        printf '%s\n' "$new" > "$CUR/.session"
+        log_event script info recording_named "Записи дано имя клиента" "session=$new" "from=$old"
+        echo "✅ Запись: $new"
+    fi
+    rm -f "$CUR/.name-pending"
+    if live_enabled && [ "${2:-}" != --no-live ] && recording; then start_live "$new"; fi
 }
 
 # Прямой эфир — отдельный процесс LiveStream: читает тот же WAV и шлёт куски на сервер. Если он упадёт
@@ -239,6 +278,7 @@ stop() {
     fi
     stop_live
     check_capture
+    rm -f "$CUR/.name-pending"   # имя так и не ввели — запись сохранится с датой и временем
     local found=0 empty=0 w base out gf gm dur ferr="$DIR/logs/ffmpeg-last.log"
     for w in "$CUR"/*.wav; do
         [ -f "$w" ] || continue
@@ -521,7 +561,8 @@ logs_state() {
 
 status() {
     if recording; then
-        echo "Идёт запись — $(grep "уровень" "$LOG" | tail -1)"
+        echo "Идёт запись «$(log_session)» — $(grep "уровень" "$LOG" | tail -1)"
+        if [ -f "$CUR/.name-pending" ]; then echo "Имя клиента ещё не введено: call-recorder name «Имя»"; fi
         if mic_silent; then echo "⚠️  Микрофон молчит: разрешите CallTap доступ к микрофону (Системные настройки → Конфиденциальность и безопасность → Микрофон)"; fi
         if live_running; then echo "📡 Прямой эфир: $(cat "$DIR/logs/live-status" 2>/dev/null)"; fi
     else
@@ -562,6 +603,7 @@ set_server() {
 
 case "${1:-}" in
     on|start) trap send_logs_later EXIT; start "${2:-}" ;;
+    name) trap send_logs_later EXIT; name_recording "${2:-}" "${3:-}" ;;
     off|stop) trap send_logs_later EXIT; stop ;;
     status) status ;;
     split)
@@ -579,5 +621,5 @@ case "${1:-}" in
     errors) show_errors "${2:-30}" ;;
     send-logs) send_logs "${2:-}" ;;
     log-event) shift; log_event "$@" ;;   # для кнопки в строке меню и тестов
-    *) echo "использование: call-recorder on [\"Имя клиента\"] | off | status | split on|off | live on|off | server <адрес> | token | upload | errors [N] | send-logs"; exit 2 ;;
+    *) echo "использование: call-recorder on [\"Имя клиента\" | --name-later] | name [\"Имя клиента\"] | off | status | split on|off | live on|off | server <адрес> | token | upload | errors [N] | send-logs"; exit 2 ;;
 esac

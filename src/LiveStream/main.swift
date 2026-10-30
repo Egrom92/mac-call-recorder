@@ -141,6 +141,9 @@ final class TrackSender {
 
     func finish() { cond.lock(); finishing = true; cond.signal(); cond.unlock() }
 
+    /// Сколько кусков ещё влезет в очередь, пока не начнут выбрасываться старые.
+    var room: Int { cond.lock(); defer { cond.unlock() }; return maxQueued - queue.count }
+
     func run() {
         while true {
             cond.lock()
@@ -328,11 +331,19 @@ let themResampler = TrackResampler(rate: wav.rate, sender: them)   // канал
 let meResampler = TrackResampler(rate: wav.rate, sender: me)       // канал 2 — микрофон
 var position = wav.dataStart
 let frameBytes = UInt64(2 * wav.channels)
+let sourceBytesPerChunk = UInt64(wav.rate / 2) * frameBytes   // 0,5 с исходного WAV — один кусок эфира
+// Эфир включили позже начала записи (после ввода имени клиента) — уже записанное догоняем порциями, сколько
+// влезает в очереди; иначе начало разговора выбросилось бы, как при отставании сети.
+let catchUpEnd = (try? h.seekToEnd()) ?? 0
 
 /// Читает всё, что CallTap дописал с прошлого раза (целыми кадрами), и раздаёт по дорожкам.
 func pump() {
     guard let size = try? h.seekToEnd(), size >= position + frameBytes else { return }
-    let length = (size - position) / frameBytes * frameBytes
+    var length = (size - position) / frameBytes * frameBytes
+    if position < catchUpEnd {
+        length = min(length, UInt64(max(0, min(me.room, them.room) - 1)) * sourceBytesPerChunk)
+        guard length > 0 else { return }
+    }
     guard (try? h.seek(toOffset: position)) != nil, let data = try? h.read(upToCount: Int(length)), !data.isEmpty else { return }
     position += UInt64(data.count)
     let frames = data.count / Int(frameBytes)
