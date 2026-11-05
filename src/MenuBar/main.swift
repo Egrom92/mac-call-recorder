@@ -286,6 +286,48 @@ func installEditMenu() {
     NSApp.mainMenu = main
 }
 
+// MARK: - Окно «Имя клиента»
+
+/// Текст из буфера обмена для поля имени клиента — одной строкой, без лишних пробелов. То, что менеджеры паролей
+/// помечают скрытым или временным (org.nspasteboard.ConcealedType / TransientType), не берём: пароль не должен
+/// попасть в название записи и на сервер. macOS может спросить разрешение на чтение буфера (потом — «Конфиденциальность
+/// и безопасность» → «Вставка из других приложений»); без разрешения поле просто пустое.
+func clipboardName(_ pb: NSPasteboard = .general) -> String {
+    let hidden = ["org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType"]
+    if pb.types?.contains(where: { hidden.contains($0.rawValue) }) == true { return "" }
+    return (pb.string(forType: .string) ?? "").split(whereSeparator: \.isWhitespace).joined(separator: " ")
+}
+
+/// Поле имени клиента и кнопка «Очистить» справа от него — accessoryView окна «Имя клиента».
+final class ClientNameView: NSStackView {
+    let field = NSTextField(string: "")
+
+    init(text: String) {
+        super.init(frame: .zero)
+        field.stringValue = text
+        field.placeholderString = "Например: Эрик Эглиенс"
+        field.widthAnchor.constraint(equalToConstant: 240).isActive = true
+        let clear = NSButton(title: "Очистить", target: self, action: #selector(clearField))
+        clear.toolTip = "Стереть имя и ввести заново"
+        orientation = .horizontal
+        alignment = .centerY
+        spacing = 8
+        addArrangedSubview(field)
+        addArrangedSubview(clear)
+        frame.size = fittingSize
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) не используется") }
+
+    /// Курсор в поле. Текст в нём выделяется целиком: набранное с клавиатуры заменит вставленное.
+    func focus() { window?.makeFirstResponder(field) }
+
+    @objc func clearField() {
+        field.stringValue = ""
+        focus()
+    }
+}
+
 // MARK: - Окно «Детали»
 
 /// Уровни текущей записи прямо из её WAV: CallTap дописывает файл порциями примерно каждые 0,2 с
@@ -664,21 +706,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Имя клиента, пока запись уже идёт: попадёт в название папки «ГГГГ-ММ-ДД_ЧЧ-ММ_Имя» и в карточку на сервере
     /// (call-recorder.sh name переименует запись и включит «Прямой эфир»). Если звонок закончится, пока окно открыто,
     /// оно закроется само, набранное имя всё равно достанется записи, и запись сохранится.
+    /// В поле сразу вставлен текст из буфера обмена (выделен — можно просто печатать поверх), курсор в поле;
+    /// «Очистить» стирает его.
     func askClientName() {
         let a = NSAlert()
         a.messageText = "Запись идёт. Имя клиента?"
         a.informativeText = "Как в карточке или в телефоне. Можно оставить пустым — клиента выберете потом на сервере."
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
-        field.placeholderString = "Например: Эрик Эглиенс"
-        a.accessoryView = field
+        let nameView = ClientNameView(text: clipboardName())
+        a.accessoryView = nameView
         a.addButton(withTitle: "Готово")
         a.addButton(withTitle: "Без имени")
-        a.window.initialFirstResponder = field
         nameAlert = a
         NSApp.activate(ignoringOtherApps: true)
+        // initialFirstResponder окно NSAlert не слушается — фокус остаётся на самом окне. Ставим курсор в поле,
+        // когда окно уже на экране: блок выполнится в первом же витке модального цикла runModal.
+        RunLoop.main.perform(inModes: [.modalPanel]) { nameView.focus() }
         let response = a.runModal()
         nameAlert = nil
-        let name = response == .alertSecondButtonReturn ? "" : field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = response == .alertSecondButtonReturn ? "" : nameView.field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if stopAfterNameAlert {
             stopAfterNameAlert = false
             run(["name", name, "--no-live"]) { [weak self] _ in self?.autoStop() }
